@@ -1,0 +1,76 @@
+# systemd unit for NjuskaAutoBot.
+#
+# Install:
+#   sudo install -m 0644 njuska-auto-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now njuska-auto-bot
+#
+# Manage:
+#   sudo systemctl status njuska-auto-bot
+#   sudo journalctl -u njuska-auto-bot -f         # follow logs
+#   sudo systemctl restart njuska-auto-bot
+#   sudo systemctl stop njuska-auto-bot
+#
+# See deploy/DEPLOY.md for the full setup walkthrough.
+
+[Unit]
+Description=NjuskaAutoBot — polovniautomobili.com → Telegram
+Documentation=https://github.com/filipp-ignatenko/njuska-auto-bot
+# Wait for network to be reachable before starting (TG API needs it).
+# `network-online.target` is the right one — `network.target` only means
+# "the kernel knows about interfaces", which is too early.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=njuska
+Group=njuska
+
+# All bot state lives under one directory: binary, .env, SQLite DB, dumps.
+# Easy to back up — just snapshot /opt/njuska-auto-bot.
+WorkingDirectory=/opt/njuska-auto-bot
+ExecStart=/opt/njuska-auto-bot/njuska_auto_bot
+
+# Reload the env file by restarting the service (`systemctl restart`). systemd
+# reads it once at start; the bot itself reads .env via dotenvy at startup too,
+# either way works.
+EnvironmentFile=/opt/njuska-auto-bot/.env
+
+# Crashes / non-zero exits → systemd restarts us after 10 seconds. Doesn't
+# loop tight: `RestartSec` cools it down. If we exit cleanly (signal-driven
+# shutdown), no restart.
+Restart=on-failure
+RestartSec=10s
+
+# Forward stdout/stderr to journald — tracing output goes here too.
+# Browse with `journalctl -u njuska-auto-bot`.
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening ---
+# These tighten the privilege & filesystem-access envelope. Cheap insurance
+# against bugs that try to do something they shouldn't.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Everything outside ReadWritePaths is mounted read-only to the service.
+ProtectSystem=strict
+ReadWritePaths=/opt/njuska-auto-bot
+# No need to read other users' home dirs.
+ProtectHome=true
+# We don't need raw sockets, just TCP for HTTPS.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Block dangerous syscalls.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Memory cap — bot uses ~50 MB idle; 200 MB ceiling catches runaway leaks
+# without ever bothering us at normal usage.
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

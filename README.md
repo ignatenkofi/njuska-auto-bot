@@ -122,6 +122,12 @@ To broadcast to a channel instead of a personal chat:
 5. Leave `AUTHORIZED_USER_ID` as **your** user id (commands still come from a
    person, not the channel).
 
+### Production deployment (Linux VM + systemd)
+
+See [deploy/DEPLOY.md](deploy/DEPLOY.md) — Proxmox-flavoured walkthrough for
+running the bot as a systemd service on a dedicated user, with backup,
+upgrade, and troubleshooting notes.
+
 ## Configuration
 
 All knobs live in `.env`. See `.env.example` for the full annotated list.
