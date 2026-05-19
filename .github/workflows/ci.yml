@@ -1,0 +1,58 @@
+# Runs on every push and pull request: fmt + clippy + tests + release build.
+#
+# Caching keeps the cycle under a minute after the first run.
+# `curl` is preinstalled on `ubuntu-latest`, so the scraper's runtime
+# dependency is satisfied for the test suite (which uses a saved HTML
+# fixture and never makes a real HTTP request — see `tests/fixtures/`).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs when a new commit lands on the same branch — keeps
+# the queue from filling up with stale jobs while you iterate.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt · clippy · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `dtolnay/rust-toolchain` is the de facto Rust toolchain action — small,
+      # well-maintained, no Docker. Pinning to `stable` so the bot doesn't
+      # accidentally rely on a nightly feature.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Caches: ~/.cargo/registry, ~/.cargo/git, ./target. Keyed on Cargo.lock
+      # so dependency upgrades invalidate cleanly.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-features --no-fail-fast
+
+      # Release build last — slower, but proves the bot actually packages.
+      # Artifact upload is intentionally absent: we don't ship binaries from
+      # CI yet. Add `actions/upload-artifact` here when we want a downloadable
+      # release.
+      - name: cargo build --release
+        run: cargo build --release
