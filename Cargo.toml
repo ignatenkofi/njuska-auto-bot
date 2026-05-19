@@ -1,0 +1,68 @@
+[package]
+name = "njuska_auto_bot"
+version = "0.1.0"
+edition = "2024"
+description = "Telegram bot that polls polovniautomobili.com for new used-car listings"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Async runtime. "full" pulls in everything (rt, macros, time, fs, signal, ...).
+# For a small bot it's fine; later we can narrow it if compile time matters.
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client. rustls-tls so we don't depend on system OpenSSL.
+# "gzip" lets the server compress responses (polite + faster).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# HTML parsing. CSS selectors via the `selectors` crate under the hood.
+scraper = "0.20"
+
+# SQLite. "bundled" compiles SQLite from source — no system libsqlite3 required.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Logging / tracing.
+# `tracing` is the facade; `tracing-subscriber` is the actual collector/formatter.
+# "env-filter" lets us drive log level from RUST_LOG env var.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling.
+# `anyhow` — ergonomic catch-all for the binary boundary (main, top-level handlers).
+# `thiserror` — derive-based, for typed errors in library-ish modules (we'll use it
+# when a module needs callers to match on specific error variants).
+anyhow = "1"
+thiserror = "2"
+
+# .env loader. `dotenvy` is the maintained fork of `dotenv`.
+dotenvy = "0.15"
+
+# Serde for config structs and Telegram JSON payloads.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# URL building (safer than string concatenation for query params).
+url = "2"
+
+# Timestamps for HTML dump rotation and DB rows.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# Telegram bot framework. We adopt it in v2 for *receiving* commands from the
+# user (long-polling), command parsing via `#[derive(BotCommands)]`, and the
+# dialogue framework for multi-step prompts. The existing send-only path keeps
+# working through teloxide's `Bot` type — see `src/telegram.rs`.
+#
+# Note: this is a heavy dep (~80 transitive crates). First-time compile will
+# noticeably slow down. The payoff is not having to hand-write update polling,
+# JSON deserialisation for every Telegram type, or a dialogue state machine.
+teloxide = { version = "0.17", features = ["macros"] }
+
+[dev-dependencies]
+# Temp files / temp dirs that auto-delete at end of scope — used by storage tests
+# so they don't touch the real database file.
+tempfile = "3"
+
+[profile.release]
+# Smaller binary, slightly slower compile — fine for a long-running bot.
+lto = "thin"
+strip = "symbols"

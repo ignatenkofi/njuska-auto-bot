@@ -1,0 +1,21 @@
+# Build artifacts
+/target
+
+# Local secrets — never commit
+.env
+.env.local
+
+# Local SQLite database file(s)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Raw HTML dumps captured for parser debugging
+/dumps/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
