@@ -19,3 +19,7 @@
 .idea/
 .vscode/
 *.swp
+
+# Wrangler local cache — contains your CF account-id, not a secret per se
+# but best practice to keep it local.
+cf-proxy/.wrangler/
