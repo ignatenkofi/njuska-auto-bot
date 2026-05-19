@@ -27,6 +27,21 @@ pipeline / docs session. Grouped roughly; nothing here is urgent.
 - [ ] **Dynamic brand/model catalog.** The 18 hardcoded brands are a
   maintenance pothole. Periodically fetch the dropdowns from polovni and
   persist to DB, retiring the `/setbrand <slug>` fallback.
+- [ ] **Daily poll interval preset.** Add `сутки` / 24h as a one-tap option
+  in the `/filter` interval picker. Current presets cap at 2 hours, but for
+  "слежу за рынком в целом" use case 24h is the right cadence.
+- [ ] **Body types as labels, not codes.** Selected body types are rendered
+  as the numeric polovni codes (e.g. `1, 4, 6`) in `/status` / filter
+  summary — should reverse-lookup against the same catalog the picker uses
+  and show `sedan, kombi, SUV`. Cosmetic but actively confusing.
+- [ ] **Transmission filter (manual / automatic).** First user feedback:
+  needs a gearbox-type filter in the `/filter` wizard. Single-select toggle,
+  same shape as body type but smaller catalog.
+- [ ] **Shrink / restructure the command surface.** 11 commands today is
+  too many for the TG `/`-autocomplete menu. Options: collapse `/clear`,
+  `/clear_confirm`, `/dump`, `/cancel` under an `/admin` (or similar)
+  sub-menu; promote `/filter` as the main entry; hide debug commands.
+  Goal: new user opens the bot and sees 3-4 commands, not a wall.
 
 ## Robustness & ops
 
