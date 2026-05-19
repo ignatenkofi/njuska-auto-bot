@@ -53,7 +53,7 @@ sudo useradd --system --create-home --home-dir /opt/njuska-auto-bot --shell /usr
 
 ```bash
 sudo -u njuska curl -L --fail \
-    https://github.com/ignatenkofi/njuska-auto-bot/releases/download/nightly/njuska_auto_bot \
+    https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot \
     -o /opt/njuska-auto-bot/njuska_auto_bot
 
 sudo -u njuska chmod +x /opt/njuska-auto-bot/njuska_auto_bot
@@ -63,9 +63,15 @@ sudo -u njuska chmod +x /opt/njuska-auto-bot/njuska_auto_bot
     file /opt/njuska-auto-bot/njuska_auto_bot
 ```
 
-`releases/download/nightly/...` is a rolling URL — it always points at the
-latest binary built from `main`. GitHub Actions rebuilds and updates that
-release on every push that touches Rust source.
+`releases/latest/download/...` is GitHub's canonical "newest release" URL —
+it redirects to whichever tagged version was most recently published. To
+pin to a specific version, use `releases/download/v0.2.0/njuska_auto_bot`
+instead.
+
+Releases are produced only when a `v*` tag is pushed (e.g. `git tag v0.2.0
+&& git push origin v0.2.0`). Commits to `main` run tests but **do not**
+publish binaries — the separation lets unfinished work coexist on `main`
+without leaking into prod.
 
 You also need a local copy of the repo (for `deploy/update.sh`, `.env.example`,
 and the systemd unit). Lightweight clone — no toolchain involved:
@@ -161,7 +167,7 @@ sudo /opt/njuska-auto-bot/src/deploy/update.sh
 # (Equivalent manually:)
 # sudo systemctl stop njuska-auto-bot
 # sudo -u njuska curl -L --fail \
-#     https://github.com/ignatenkofi/njuska-auto-bot/releases/download/nightly/njuska_auto_bot \
+#     https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot \
 #     -o /opt/njuska-auto-bot/njuska_auto_bot
 # sudo -u njuska chmod +x /opt/njuska-auto-bot/njuska_auto_bot
 # sudo systemctl start njuska-auto-bot

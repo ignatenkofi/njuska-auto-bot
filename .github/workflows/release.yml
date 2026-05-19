@@ -1,45 +1,43 @@
-# Builds a stripped Linux x86_64 binary on every push to main and publishes it
-# to the `nightly` rolling GitHub Release. Deployment hosts then just curl the
-# binary down — no Rust toolchain on the VM, no `cargo build` after every
-# deploy.
+# Builds a stripped Linux x86_64 binary and publishes a GitHub Release.
 #
-# Why `ubuntu-22.04` and not `ubuntu-latest`?
-# `ubuntu-latest` is currently 24.04 with glibc 2.39. Many deployment targets
-# (Debian 12, older Ubuntu, etc.) run glibc 2.35-2.36. A binary linked against
-# 2.39 may fail on those with `GLIBC_2.39 not found`. 22.04 ships glibc 2.35,
-# which is older than essentially every supported target, so the resulting
-# binary is portable across them.
+# Trigger: **only** on push of a semver-shaped tag (`v0.1.0`, `v1.2.3-rc1`).
+# Commits to main don't ship — they go through `ci.yml` (fmt/clippy/tests)
+# but produce no artifact. To release, tag the commit you trust:
 #
-# Why a single rolling `nightly` release, not a per-commit tag?
-# For a one-author hobby bot this is enough — `releases/download/nightly/...`
-# is a stable URL the VM can curl forever. When we want a semver release,
-# add a tag-triggered job that publishes a `v0.X.Y` release; both can coexist.
+#   git tag v0.2.0
+#   git push origin v0.2.0
+#
+# That gives a clean separation between "is `main` green?" (every commit)
+# and "is this version production-ready?" (only when you decide).
+#
+# Why `ubuntu-22.04`? See identical comment in original incarnation: older
+# glibc (2.35) than Debian 12 (2.36), so the binary is portable across
+# essentially all current production targets.
 
 name: Release
 
 on:
   push:
-    branches: [main]
-    # Don't rebuild a binary when only docs/config changed.
-    paths-ignore:
-      - "**.md"
-      - "cf-proxy/**"
-      - "deploy/**"
+    tags: ["v*"]
+  # Lets you re-trigger a release from the Actions UI if needed.
   workflow_dispatch:
-
-# Drop in-flight builds when a new commit lands — we only care about latest.
-concurrency:
-  group: release-nightly
-  cancel-in-progress: true
+    inputs:
+      tag:
+        description: "Tag to release (must already exist, e.g. v0.1.0)"
+        required: true
 
 jobs:
   release:
-    name: Build & publish nightly
+    name: Build & publish ${{ github.ref_name }}
     runs-on: ubuntu-22.04
     permissions:
-      contents: write # required to create/update releases via `gh release`
+      contents: write # needed for `gh release create`
     steps:
       - uses: actions/checkout@v6
+        with:
+          # When invoked via workflow_dispatch, check out the specified tag
+          # rather than HEAD of the default branch.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -51,34 +49,24 @@ jobs:
         run: cargo build --release
 
       - name: Strip symbols
-        # Cuts ~5MB off a debug-symbols-included binary. Cosmetic at our size
-        # but a clean habit.
         run: strip target/release/njuska_auto_bot
 
       - name: Show binary info
-        # Helpful diagnostic in CI logs: confirms dynamic deps stay tiny.
-        # We expect basically just libc (rusqlite bundles SQLite, rustls
-        # pulls in no system TLS, etc.)
+        # Sanity in CI logs: dynamic deps should be tiny (just libc).
         run: |
           ls -la target/release/njuska_auto_bot
           file target/release/njuska_auto_bot
           ldd target/release/njuska_auto_bot || true
 
-      - name: Publish nightly release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Delete the previous nightly release + tag (--cleanup-tag) if it
-          # exists. `|| true` so the first run, when no nightly yet, doesn't
-          # fail the job.
-          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
-
-          # Recreate. --prerelease keeps GitHub from displaying "nightly" as
-          # the repo's headline "Latest" release. The stable URL
-          #   releases/download/nightly/njuska_auto_bot
-          # still works regardless of prerelease flag.
-          gh release create nightly \
+          TAG="${{ inputs.tag || github.ref_name }}"
+          # --generate-notes derives a changelog from commits since the
+          # previous tag — saves us writing release notes by hand for the
+          # common case.
+          gh release create "$TAG" \
             target/release/njuska_auto_bot \
-            --title "nightly (rolling)" \
-            --notes "Auto-built from $(git rev-parse --short HEAD) at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --prerelease
+            --title "$TAG" \
+            --generate-notes

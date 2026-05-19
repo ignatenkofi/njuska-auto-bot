@@ -13,7 +13,11 @@
 
 set -euo pipefail
 
-BINARY_URL="https://github.com/ignatenkofi/njuska-auto-bot/releases/download/nightly/njuska_auto_bot"
+# `releases/latest/download/<file>` is GitHub's canonical "the newest
+# non-prerelease asset" URL — redirects to whichever version was published
+# most recently. Pin to a specific version (e.g. v0.2.0/download/...) if
+# you want to opt out of auto-upgrades.
+BINARY_URL="https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot"
 DEST="/opt/njuska-auto-bot/njuska_auto_bot"
 SERVICE="njuska-auto-bot"
 
