@@ -13,6 +13,7 @@ use tokio::process::Command;
 use tracing::debug;
 use url::Url;
 
+use crate::config::ProxyConfig;
 use crate::models::{Listing, SearchFilter};
 
 /// Base URL used to resolve relative listing links into absolute URLs.
@@ -78,35 +79,66 @@ pub enum ScraperError {
 /// confirmed: any reqwest+hyper request — over HTTP/2 *or* forced HTTP/1.1,
 /// with rustls *or* native-tls, with title-case or lowercase headers — receives
 /// a 403 with `cf-mitigated: challenge`. Bare `curl --http1.1` from the same
-/// machine and IP gets 200. The fingerprint difference is somewhere deep in
-/// the TLS/HTTP stack and not worth chasing for a personal-scale bot.
+/// machine and IP gets 200 on **macOS**, but **also 403 on Linux** (even with
+/// curl-impersonate; the differentiator is somewhere in the TCP/TLS stack
+/// below curl's control). Workaround: see `proxy` parameter below.
 ///
 /// Trade-offs of the curl approach:
-/// - **+** Works reliably with zero ongoing maintenance.
+/// - **+** Works reliably with zero ongoing maintenance on macOS.
 /// - **+** Defers TLS to a battle-tested implementation we don't own.
 /// - **-** Runtime dep: `curl` must be in `PATH` (it is on macOS/Linux/Win10+).
-/// - **-** One process spawn per fetch (~10 ms). At a 10-minute poll cadence
-///   this is comfortably below the noise floor.
+/// - **-** Linux + CF often = 403; needs the `proxy` arg.
+///
+/// `proxy = Some(…)` routes the request through a Cloudflare Worker that we
+/// host (`cf-proxy/` in the repo). The Worker forwards the request to polovni
+/// from CF's own infrastructure, which CF doesn't challenge. Required for
+/// Linux deployments behind CF; harmless on macOS where direct works too.
 ///
 /// stderr/stdout split trick: `curl -w "%{stderr}%{http_code}"` writes the
 /// HTTP status code to **stderr** (no newline), leaving stdout as a clean
 /// stream of the response body. Captured separately by `output().await`.
-pub async fn fetch_search(filter: &SearchFilter) -> Result<String, ScraperError> {
-    let url = filter.to_url();
-    debug!(url = %url, "fetching search page via curl");
+pub async fn fetch_search(
+    filter: &SearchFilter,
+    proxy: Option<&ProxyConfig>,
+) -> Result<String, ScraperError> {
+    let original_url = filter.to_url();
+    // When a proxy is configured, swap host+scheme with the Worker's URL but
+    // keep path + query intact — that's what the Worker forwards verbatim.
+    let request_url = match proxy {
+        Some(p) => {
+            let mut u = p.url.clone();
+            u.set_path(original_url.path());
+            u.set_query(original_url.query());
+            u
+        }
+        None => original_url,
+    };
 
-    let output = Command::new("curl")
-        .arg("--http1.1")
+    debug!(
+        url = %request_url,
+        via_proxy = proxy.is_some(),
+        "fetching search page via curl"
+    );
+
+    let mut cmd = Command::new("curl");
+    cmd.arg("--http1.1")
         .arg("-s") // silent: no progress bar
         .arg("-A")
         .arg(USER_AGENT_STRING)
         .arg("--max-time")
         .arg(FETCH_TIMEOUT_SECS.to_string())
         .arg("-w")
-        .arg("%{stderr}%{http_code}") // status code -> stderr, body -> stdout
-        .arg(url.as_str())
-        .output()
-        .await?;
+        .arg("%{stderr}%{http_code}"); // status code -> stderr, body -> stdout
+
+    // Authenticate to our Worker. Header value is treated as opaque on the
+    // CLI; no shell-escaping concerns since `secret` from env is alphanumeric.
+    if let Some(p) = proxy {
+        cmd.arg("-H").arg(format!("x-proxy-secret: {}", p.secret));
+    }
+
+    cmd.arg(request_url.as_str());
+
+    let output = cmd.output().await?;
 
     // curl itself failed (network/TLS error, not HTTP error).
     if !output.status.success() {

@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use url::Url;
 
 use crate::models::{SearchFilter, ShowOldNew};
 use crate::storage::Storage;
@@ -68,6 +69,35 @@ pub struct StaticConfig {
     pub dumps_dir: PathBuf,
     /// Delete HTML dump folders older than this many days. `0` disables rotation.
     pub dump_retention_days: u32,
+    /// Optional Cloudflare Worker proxy. When `Some`, all `polovniautomobili.com`
+    /// fetches go through this Worker (which forwards them on CF's own
+    /// infrastructure). Bypasses CF's direct-fetch challenge — needed when
+    /// the bot runs from a Linux network stack (homelab VMs, most VPS).
+    /// Configure via `CF_PROXY_URL` + `CF_PROXY_SECRET`; see `cf-proxy/README.md`.
+    pub cf_proxy: Option<ProxyConfig>,
+}
+
+/// Settings for routing scraper fetches through a Cloudflare Worker.
+/// Loaded from `CF_PROXY_URL` + `CF_PROXY_SECRET`. Both env vars must be set
+/// together — providing only one is treated as "no proxy".
+#[derive(Clone)]
+pub struct ProxyConfig {
+    /// Worker URL, e.g. `https://nau-proxy.<your-subdomain>.workers.dev`.
+    pub url: Url,
+    /// Shared secret sent as `x-proxy-secret` header. Must match the
+    /// `PROXY_SECRET` env var set on the Worker via `wrangler secret put`.
+    pub secret: String,
+}
+
+// Manual `Debug` so the shared secret doesn't accidentally leak via
+// `info!("{:?}", config)`. URL is fine to print.
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("url", &self.url.as_str())
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 // Manual `Debug` to redact `telegram_token`. `#[derive(Debug)]` would dump it.
@@ -85,6 +115,7 @@ impl std::fmt::Debug for StaticConfig {
             )
             .field("dumps_dir", &self.dumps_dir)
             .field("dump_retention_days", &self.dump_retention_days)
+            .field("cf_proxy", &self.cf_proxy)
             .finish()
     }
 }
@@ -103,8 +134,22 @@ impl StaticConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./dumps")),
             dump_retention_days: opt_parsed::<u32>("DUMP_RETENTION_DAYS")?.unwrap_or(7),
+            cf_proxy: load_cf_proxy()?,
         })
     }
+}
+
+/// Loads `CF_PROXY_URL` + `CF_PROXY_SECRET`. Both must be set; either missing
+/// → `None` (direct fetch). A malformed URL → hard error (clearer than
+/// silently falling back to direct fetch and confusing the operator).
+fn load_cf_proxy() -> Result<Option<ProxyConfig>> {
+    let (Some(url_str), Some(secret)) = (opt_string("CF_PROXY_URL"), opt_string("CF_PROXY_SECRET"))
+    else {
+        return Ok(None);
+    };
+    let url = Url::parse(&url_str)
+        .with_context(|| format!("CF_PROXY_URL={url_str:?} is not a valid URL"))?;
+    Ok(Some(ProxyConfig { url, secret }))
 }
 
 // ---------------------------------------------------------------------------

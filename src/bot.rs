@@ -131,7 +131,7 @@ async fn run_one_cycle(
         return Ok(());
     }
 
-    let html = match scraper::fetch_search(&search).await {
+    let html = match scraper::fetch_search(&search, static_cfg.cf_proxy.as_ref()).await {
         Ok(h) => h,
         Err(e) => {
             // Fetch failures (CF blocked us, network blip, curl bug) are

@@ -79,6 +79,23 @@ will run.
 > triple (`x86_64-unknown-linux-gnu` on most Proxmox VMs). With `--release`
 > the binary is statically-linked enough to portable across modern Debians.
 
+## Step 4.5 — Set up the Cloudflare Worker proxy (REQUIRED for Linux VMs)
+
+polovniautomobili.com is behind Cloudflare. Direct HTTP fetches from a Linux
+network stack are challenged and return 403 — even with `curl-impersonate`.
+The workaround is a tiny CF Worker we host that proxies the fetch from CF's
+own infrastructure (which CF doesn't challenge).
+
+**On your laptop (not the VM)**, follow [cf-proxy/README.md](../cf-proxy/README.md).
+It takes about 5 minutes:
+
+1. Install `wrangler` (`brew install node && npm install -g wrangler`), `wrangler login`
+2. From the `cf-proxy/` directory: generate a random secret and `wrangler secret put PROXY_SECRET`
+3. `wrangler deploy`
+4. Note the URL it prints + the secret
+
+You'll plug those two values into the VM's `.env` in the next step.
+
 ## Step 5 — Configure `.env`
 
 ```bash
@@ -91,6 +108,8 @@ Set at minimum:
 - `TELEGRAM_BOT_TOKEN` — from @BotFather
 - `TELEGRAM_CHAT_ID` — your user id, OR `-100xxxxxxxxxx` for a channel
 - `AUTHORIZED_USER_ID` — your user id (commands only)
+- `CF_PROXY_URL` — Worker URL from step 4.5
+- `CF_PROXY_SECRET` — Worker secret from step 4.5
 
 The search filters can be left empty here — you'll configure them through
 the bot's `/filter` wizard.
@@ -173,7 +192,12 @@ will print the panic / error. Common culprits:
 been sent to it by the configured user/chat. Telegram blocks bots from
 initiating conversations.
 
-**403 from polovniautomobili.com** — Cloudflare may have tightened its
-fingerprinting. Open one of the failing dumps (none yet at this stage, but
-the bot logs the request URL), reproduce the failure with `curl --http1.1`,
-adjust the UA string in `src/scraper.rs` if needed.
+**403 from polovniautomobili.com** — most commonly, you skipped Step 4.5
+(CF Worker proxy) or the `CF_PROXY_URL`/`CF_PROXY_SECRET` env vars aren't
+set correctly. Check `journalctl -u njuska-auto-bot -n 50` for a line like
+`fetching search page via curl url=… via_proxy=true`. If `via_proxy=false`,
+the bot is fetching directly and CF is challenging it.
+
+If `via_proxy=true` but still 403, the Worker itself is returning the 403
+(secret mismatch). Verify `CF_PROXY_SECRET` matches what's set in the Worker
+via `wrangler secret put PROXY_SECRET`.
