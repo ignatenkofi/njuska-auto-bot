@@ -28,27 +28,17 @@ SSH into the VM as a sudo-capable user:
 ```bash
 ssh you@<vm-ip>
 sudo apt update
-sudo apt install -y \
-    build-essential \
-    curl \
-    git \
-    pkg-config \
-    libssl-dev
+sudo apt install -y curl git
 ```
 
-Install Rust via [rustup](https://rustup.rs):
+That's the entire runtime dependency list. The bot binary itself is
+statically-linked against rusqlite (bundled SQLite) and rustls (no system
+OpenSSL), so the only thing it needs from the OS is `curl` (for fetching)
+and libc.
 
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-rustc --version    # should report 1.95+
-```
-
-Verify `curl` is on PATH (it should be — the bot shells out to it):
-
-```bash
-which curl
-```
+> **No Rust toolchain on the VM.** We build the binary on GitHub Actions
+> and the VM just downloads it from the `nightly` release. Saves a few GB of
+> disk and a few minutes per upgrade.
 
 ## Step 3 — Create a dedicated user
 
@@ -59,25 +49,30 @@ touch anything outside its own dir. No login shell needed.
 sudo useradd --system --create-home --home-dir /opt/njuska-auto-bot --shell /usr/sbin/nologin njuska
 ```
 
-## Step 4 — Clone & build
+## Step 4 — Download the latest binary
 
 ```bash
-sudo -u njuska -H bash <<'EOF'
-cd /opt/njuska-auto-bot
-git clone https://github.com/filipp-ignatenko/njuska-auto-bot.git src
-cd src
-cargo build --release
-cp target/release/njuska_auto_bot ..
-EOF
+sudo -u njuska curl -L --fail \
+    https://github.com/ignatenkofi/njuska-auto-bot/releases/download/nightly/njuska_auto_bot \
+    -o /opt/njuska-auto-bot/njuska_auto_bot
+
+sudo -u njuska chmod +x /opt/njuska-auto-bot/njuska_auto_bot
+
+# Sanity-check
+/opt/njuska-auto-bot/njuska_auto_bot --version 2>/dev/null || \
+    file /opt/njuska-auto-bot/njuska_auto_bot
 ```
 
-After this `/opt/njuska-auto-bot/njuska_auto_bot` is the binary the service
-will run.
+`releases/download/nightly/...` is a rolling URL — it always points at the
+latest binary built from `main`. GitHub Actions rebuilds and updates that
+release on every push that touches Rust source.
 
-> Note: building on the VM is the simplest path. If you'd rather build
-> locally and `scp` the binary, that works too — just match the target
-> triple (`x86_64-unknown-linux-gnu` on most Proxmox VMs). With `--release`
-> the binary is statically-linked enough to portable across modern Debians.
+You also need a local copy of the repo (for `deploy/update.sh`, `.env.example`,
+and the systemd unit). Lightweight clone — no toolchain involved:
+
+```bash
+sudo -u njuska git clone https://github.com/ignatenkofi/njuska-auto-bot.git /opt/njuska-auto-bot/src
+```
 
 ## Step 4.5 — Set up the Cloudflare Worker proxy (REQUIRED for Linux VMs)
 
@@ -160,14 +155,16 @@ sudo systemctl start njuska-auto-bot
 # Disable autostart on boot
 sudo systemctl disable njuska-auto-bot
 
-# Upgrade — pull, rebuild, restart
-sudo -u njuska -H bash <<'EOF'
-cd /opt/njuska-auto-bot/src
-git pull
-cargo build --release
-cp -f target/release/njuska_auto_bot ..
-EOF
-sudo systemctl restart njuska-auto-bot
+# Upgrade — pull new binary, restart
+sudo /opt/njuska-auto-bot/src/deploy/update.sh
+
+# (Equivalent manually:)
+# sudo systemctl stop njuska-auto-bot
+# sudo -u njuska curl -L --fail \
+#     https://github.com/ignatenkofi/njuska-auto-bot/releases/download/nightly/njuska_auto_bot \
+#     -o /opt/njuska-auto-bot/njuska_auto_bot
+# sudo -u njuska chmod +x /opt/njuska-auto-bot/njuska_auto_bot
+# sudo systemctl start njuska-auto-bot
 ```
 
 ## Backup

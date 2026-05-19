@@ -1,0 +1,84 @@
+# Builds a stripped Linux x86_64 binary on every push to main and publishes it
+# to the `nightly` rolling GitHub Release. Deployment hosts then just curl the
+# binary down — no Rust toolchain on the VM, no `cargo build` after every
+# deploy.
+#
+# Why `ubuntu-22.04` and not `ubuntu-latest`?
+# `ubuntu-latest` is currently 24.04 with glibc 2.39. Many deployment targets
+# (Debian 12, older Ubuntu, etc.) run glibc 2.35-2.36. A binary linked against
+# 2.39 may fail on those with `GLIBC_2.39 not found`. 22.04 ships glibc 2.35,
+# which is older than essentially every supported target, so the resulting
+# binary is portable across them.
+#
+# Why a single rolling `nightly` release, not a per-commit tag?
+# For a one-author hobby bot this is enough — `releases/download/nightly/...`
+# is a stable URL the VM can curl forever. When we want a semver release,
+# add a tag-triggered job that publishes a `v0.X.Y` release; both can coexist.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    # Don't rebuild a binary when only docs/config changed.
+    paths-ignore:
+      - "**.md"
+      - "cf-proxy/**"
+      - "deploy/**"
+  workflow_dispatch:
+
+# Drop in-flight builds when a new commit lands — we only care about latest.
+concurrency:
+  group: release-nightly
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build & publish nightly
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # required to create/update releases via `gh release`
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Strip symbols
+        # Cuts ~5MB off a debug-symbols-included binary. Cosmetic at our size
+        # but a clean habit.
+        run: strip target/release/njuska_auto_bot
+
+      - name: Show binary info
+        # Helpful diagnostic in CI logs: confirms dynamic deps stay tiny.
+        # We expect basically just libc (rusqlite bundles SQLite, rustls
+        # pulls in no system TLS, etc.)
+        run: |
+          ls -la target/release/njuska_auto_bot
+          file target/release/njuska_auto_bot
+          ldd target/release/njuska_auto_bot || true
+
+      - name: Publish nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete the previous nightly release + tag (--cleanup-tag) if it
+          # exists. `|| true` so the first run, when no nightly yet, doesn't
+          # fail the job.
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+
+          # Recreate. --prerelease keeps GitHub from displaying "nightly" as
+          # the repo's headline "Latest" release. The stable URL
+          #   releases/download/nightly/njuska_auto_bot
+          # still works regardless of prerelease flag.
+          gh release create nightly \
+            target/release/njuska_auto_bot \
+            --title "nightly (rolling)" \
+            --notes "Auto-built from $(git rev-parse --short HEAD) at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --prerelease
