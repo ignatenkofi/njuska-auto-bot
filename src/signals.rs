@@ -59,6 +59,9 @@ pub async fn shutdown_signal() {
 ///
 /// On non-Unix targets (Windows), we only have Ctrl+C. The `cfg` split is
 /// the standard pattern for "platform feature only on Unix".
+// Justified expect: if we can't install a SIGTERM handler we can't shut
+// down gracefully anyway — crashing at startup is the honest outcome.
+#[allow(clippy::expect_used)]
 async fn os_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -87,6 +90,7 @@ async fn os_shutdown_signal() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 

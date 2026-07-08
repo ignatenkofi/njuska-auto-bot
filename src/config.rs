@@ -479,6 +479,7 @@ fn opt_bool(key: &str) -> Result<Option<bool>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 

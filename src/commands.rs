@@ -931,19 +931,24 @@ async fn handle_resume(ctx: &CommandContext) -> String {
     "▶️ Поллинг возобновлён.".into()
 }
 
+/// Locks a `std::sync::Mutex`, treating poisoning as a bug to surface loudly
+/// (a previous holder panicked mid-update), not a runtime error to handle.
+/// Centralised so the justified `expect` lives in exactly one place — the
+/// crate denies `clippy::expect_used` everywhere else (#23).
+#[allow(clippy::expect_used)]
+fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().expect("mutex poisoned")
+}
+
 /// Two-step destructive op: `/clear` arms a pending state; `/clear_confirm`
 /// within [`CLEAR_CONFIRM_WINDOW`] actually wipes. Without this gate, a
 /// fat-finger near the input bar could nuke the whole dedup set.
 ///
 /// `handle_clear` is synchronous — we only touch the Mutex<Instant>, no I/O.
 fn handle_clear(ctx: &CommandContext) -> String {
-    // `expect("pending_clear mutex poisoned")` mirrors storage's stance:
-    // poisoning means a holder panicked, which is a bug to surface loudly,
-    // not a runtime error to handle.
-    let mut pending = ctx
-        .pending_clear
-        .lock()
-        .expect("pending_clear mutex poisoned");
+    // `lock_unpoisoned` mirrors storage's stance: poisoning means a holder
+    // panicked, which is a bug to surface loudly, not a runtime error.
+    let mut pending = lock_unpoisoned(&ctx.pending_clear);
     *pending = Some(Instant::now());
 
     let count = ctx.storage.seen_count().unwrap_or(0);
@@ -964,10 +969,7 @@ async fn handle_clear_confirm(ctx: &CommandContext) -> String {
     // a failure here means a real DB problem the user needs to retry from
     // scratch, not auto-arm a second wipe attempt.
     let pending = {
-        let mut p = ctx
-            .pending_clear
-            .lock()
-            .expect("pending_clear mutex poisoned");
+        let mut p = lock_unpoisoned(&ctx.pending_clear);
         p.take()
     };
 
@@ -1056,12 +1058,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Returning to the menu always discards any in-flight picker
             // edits. "Back without saving" semantics belong here, central,
             // rather than duplicated in every picker's Back path.
-            *ctx.chassis_draft
-                .lock()
-                .expect("chassis_draft mutex poisoned") = None;
-            *ctx.models_draft
-                .lock()
-                .expect("models_draft mutex poisoned") = None;
+            *lock_unpoisoned(&ctx.chassis_draft) = None;
+            *lock_unpoisoned(&ctx.models_draft) = None;
 
             let (search, interval_secs) = {
                 let r = ctx.runtime.read().await;
@@ -1099,9 +1097,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Initialise draft = current runtime.chassis so the picker opens
             // with existing selections checked.
             let initial = ctx.runtime.read().await.search.chassis.clone();
-            *ctx.chassis_draft
-                .lock()
-                .expect("chassis_draft mutex poisoned") = Some(initial.clone());
+            *lock_unpoisoned(&ctx.chassis_draft) = Some(initial.clone());
             (
                 "Выбери типы кузова (можно несколько):".to_string(),
                 Some(chassis_picker_keyboard(&initial)),
@@ -1110,10 +1106,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
         CB_FILTER_CHASSIS_SAVE => {
             // Commit the draft to runtime + DB. The draft becomes the new
             // selection, even if empty (= "no chassis filter").
-            let draft = ctx
-                .chassis_draft
-                .lock()
-                .expect("chassis_draft mutex poisoned")
+            let draft = lock_unpoisoned(&ctx.chassis_draft)
                 .take()
                 .unwrap_or_default();
             apply_chassis(&ctx, draft).await;
@@ -1130,12 +1123,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Same "leave dialog" cleanup as CB_FILTER_MENU: discard any
             // hanging drafts. Without this, an abandoned picker edit would
             // sit in memory until the bot restarted.
-            *ctx.chassis_draft
-                .lock()
-                .expect("chassis_draft mutex poisoned") = None;
-            *ctx.models_draft
-                .lock()
-                .expect("models_draft mutex poisoned") = None;
+            *lock_unpoisoned(&ctx.chassis_draft) = None;
+            *lock_unpoisoned(&ctx.models_draft) = None;
 
             let search = ctx.runtime.read().await.search.clone();
             // Final state: text only, no keyboard. `markup = None` clears it.
@@ -1290,9 +1279,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 ),
                 Some(brand_slug) => match models_for_brand(&brand_slug) {
                     Some(model_list) => {
-                        *ctx.models_draft
-                            .lock()
-                            .expect("models_draft mutex poisoned") = Some(initial_models.clone());
+                        *lock_unpoisoned(&ctx.models_draft) = Some(initial_models.clone());
                         (
                             format!("Модели для <b>{brand_slug}</b> (можно несколько):"),
                             Some(model_picker_keyboard(model_list, &initial_models)),
@@ -1310,10 +1297,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             }
         }
         CB_FILTER_MODELS_SAVE => {
-            let draft = ctx
-                .models_draft
-                .lock()
-                .expect("models_draft mutex poisoned")
+            let draft = lock_unpoisoned(&ctx.models_draft)
                 .take()
                 .unwrap_or_default();
             apply_models(&ctx, draft).await;
@@ -1342,10 +1326,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 return Ok(());
             };
             let new_state = {
-                let mut draft = ctx
-                    .models_draft
-                    .lock()
-                    .expect("models_draft mutex poisoned");
+                let mut draft = lock_unpoisoned(&ctx.models_draft);
                 let v = draft.get_or_insert_with(Vec::new);
                 if let Some(pos) = v.iter().position(|s| s == slug) {
                     v.remove(pos);
@@ -1367,10 +1348,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Toggle inside the lock, then take a snapshot for redraw —
             // never hold the Mutex past the lock scope.
             let new_state = {
-                let mut draft = ctx
-                    .chassis_draft
-                    .lock()
-                    .expect("chassis_draft mutex poisoned");
+                let mut draft = lock_unpoisoned(&ctx.chassis_draft);
                 let v = draft.get_or_insert_with(Vec::new);
                 if let Some(pos) = v.iter().position(|&x| x == code) {
                     v.remove(pos);
@@ -1833,6 +1811,7 @@ fn brand_picker_keyboard() -> InlineKeyboardMarkup {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 

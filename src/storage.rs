@@ -101,6 +101,8 @@ impl Storage {
     /// same `.expect("storage mutex poisoned")` message — poisoning means a
     /// previous holder panicked while holding the lock, which is a programmer
     /// bug rather than a recoverable runtime error.
+    // Justified expect: poisoning = a bug we want to crash on, not handle.
+    #[allow(clippy::expect_used)]
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("storage mutex poisoned")
     }
@@ -309,6 +311,7 @@ impl Storage {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 

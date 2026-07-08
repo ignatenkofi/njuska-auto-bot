@@ -446,6 +446,7 @@ async fn rotate_dumps(dumps_dir: &Path, retention_days: u32) -> std::io::Result<
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 

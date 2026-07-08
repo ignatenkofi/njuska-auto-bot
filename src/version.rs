@@ -9,6 +9,7 @@
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NJUSKA_GIT_SHA"), ")");
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 

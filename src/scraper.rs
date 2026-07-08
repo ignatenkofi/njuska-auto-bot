@@ -179,14 +179,18 @@ pub async fn fetch_search(
 // constants — a panic means **we** wrote a bad selector and the test suite
 // catches it immediately, not at runtime in prod.
 
-static SEL_LISTING: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse("article.classified").expect("listing selector"));
-static SEL_TITLE_LINK: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse("h2 a.ga-title").expect("title selector"));
-static SEL_CITY: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse(".city").expect("city selector"));
-static SEL_INFO_TOP: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse(".info .setInfo .top").expect("info-top selector"));
+/// Parses a programmer-supplied CSS selector. Justified expect (see module
+/// comment above): the inputs are string constants; a bad one is caught by
+/// the first test run, never at runtime in prod.
+#[allow(clippy::expect_used)]
+fn sel(css: &str) -> Selector {
+    Selector::parse(css).expect("static selector must parse")
+}
+
+static SEL_LISTING: LazyLock<Selector> = LazyLock::new(|| sel("article.classified"));
+static SEL_TITLE_LINK: LazyLock<Selector> = LazyLock::new(|| sel("h2 a.ga-title"));
+static SEL_CITY: LazyLock<Selector> = LazyLock::new(|| sel(".city"));
+static SEL_INFO_TOP: LazyLock<Selector> = LazyLock::new(|| sel(".info .setInfo .top"));
 
 /// Parse all listings out of a search-results page.
 ///
@@ -306,6 +310,7 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 
