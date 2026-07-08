@@ -1,4 +1,5 @@
-# Builds a stripped Linux x86_64 binary and publishes a GitHub Release.
+# Builds a stripped Linux x86_64 binary, gates it on tests + a Debian 12
+# smoke run, and publishes a GitHub Release.
 #
 # Trigger: **only** on push of a semver-shaped tag (`v0.1.0`, `v1.2.3-rc1`).
 # Commits to main don't ship — they go through `ci.yml` (fmt/clippy/tests)
@@ -10,9 +11,13 @@
 # That gives a clean separation between "is `main` green?" (every commit)
 # and "is this version production-ready?" (only when you decide).
 #
-# Why `ubuntu-22.04`? See identical comment in original incarnation: older
-# glibc (2.35) than Debian 12 (2.36), so the binary is portable across
-# essentially all current production targets.
+# Pipeline shape (#27): build → smoke → publish as three jobs, so a binary
+# that fails to *run* on the deployment OS never gets released, and the
+# red X tells you which stage died.
+#
+# Why `ubuntu-22.04` for the build? Older glibc (2.35) than Debian 12
+# (2.36), so the binary is portable across essentially all current
+# production targets — which the smoke job then proves instead of assumes.
 
 name: Release
 
@@ -26,12 +31,13 @@ on:
         description: "Tag to release (must already exist, e.g. v0.1.0)"
         required: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release:
-    name: Build & publish ${{ github.ref_name }}
+  build:
+    name: Test & build ${{ inputs.tag || github.ref_name }}
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write # needed for `gh release create`
     steps:
       - uses: actions/checkout@v6
         with:
@@ -44,6 +50,12 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      # Belt and braces: main was green when tagged, but the tag may point
+      # at an older commit, and a release built from failing tests is the
+      # single worst artifact to ship (#27).
+      - name: cargo test
+        run: cargo test --all-features --no-fail-fast
 
       - name: Build release binary
         run: cargo build --release
@@ -58,6 +70,56 @@ jobs:
           file target/release/njuska_auto_bot
           ldd target/release/njuska_auto_bot || true
 
+      - name: Upload binary for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: njuska_auto_bot
+          path: target/release/njuska_auto_bot
+          if-no-files-found: error
+          retention-days: 1
+
+  # Runs the built binary inside a *pristine* Debian 12 container — the
+  # actual deployment OS — to catch glibc/loader mismatches before they
+  # become a broken release (#27). `--version` is the designed-for-this
+  # cheap startup path: no .env, no network, no DB (see #1).
+  smoke-debian12:
+    name: Smoke test on Debian 12
+    needs: build
+    runs-on: ubuntu-latest
+    container: debian:12
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: njuska_auto_bot
+
+      - name: Run --version on Debian 12
+        run: |
+          chmod +x ./njuska_auto_bot
+          OUT="$(./njuska_auto_bot --version)"
+          echo "binary says: $OUT"
+          case "$OUT" in
+            njuska_auto_bot\ *) echo "smoke test OK" ;;
+            *) echo "unexpected --version output" >&2; exit 1 ;;
+          esac
+
+  publish:
+    name: Publish ${{ inputs.tag || github.ref_name }}
+    needs: [build, smoke-debian12]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed for `gh release create`
+    steps:
+      # gh needs a repo checkout to infer the origin repo.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: njuska_auto_bot
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,6 +129,6 @@ jobs:
           # previous tag — saves us writing release notes by hand for the
           # common case.
           gh release create "$TAG" \
-            target/release/njuska_auto_bot \
+            njuska_auto_bot \
             --title "$TAG" \
             --generate-notes

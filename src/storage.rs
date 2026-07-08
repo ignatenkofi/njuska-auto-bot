@@ -101,6 +101,8 @@ impl Storage {
     /// same `.expect("storage mutex poisoned")` message — poisoning means a
     /// previous holder panicked while holding the lock, which is a programmer
     /// bug rather than a recoverable runtime error.
+    // Justified expect: poisoning = a bug we want to crash on, not handle.
+    #[allow(clippy::expect_used)]
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("storage mutex poisoned")
     }
@@ -306,9 +308,42 @@ impl Storage {
             .query_row("SELECT COUNT(*) FROM seen_listings", [], |r| r.get(0))?;
         Ok(n as u64)
     }
+
+    /// Deletes `seen_listings` rows first seen more than `days` days ago
+    /// (#17). Returns the number of rows removed.
+    ///
+    /// Caveat (documented in `.env.example` too): if a pruned listing is
+    /// still live on the site, the next poll treats it as new and
+    /// re-notifies — the retention window should comfortably exceed how
+    /// long ads stay published.
+    pub fn prune_seen_older_than(&self, days: u32) -> Result<u64> {
+        // `first_seen` is stored via SQLite's own datetime('now') (UTC), so
+        // comparing against a datetime() modifier stays in one clock domain.
+        let changes = self
+            .conn()
+            .execute(
+                "DELETE FROM seen_listings
+                 WHERE first_seen < datetime('now', ?1)",
+                params![format!("-{days} days")],
+            )
+            .context("pruning old seen_listings rows")?;
+        Ok(changes as u64)
+    }
+
+    /// Runs `VACUUM` to give freed pages back to the OS. SQLite never shrinks
+    /// the file on DELETE alone; after pruning, this keeps njuska.db honest.
+    /// Called at most once a day from the poll loop's maintenance step.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn()
+            .execute_batch("VACUUM")
+            .context("running VACUUM")?;
+        debug!("VACUUM completed");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 
@@ -446,6 +481,36 @@ mod tests {
         // Same field values come back out — confirms the SELECT projection
         // matches the INSERT and our `as i64` ↔ `as u64` casts round-trip.
         assert_eq!(got[0], original);
+    }
+
+    #[test]
+    fn prune_removes_only_rows_older_than_retention_and_vacuum_runs() {
+        let (s, _dir) = temp_storage();
+        s.mark_seen(&[listing(1, "old"), listing(2, "fresh")])
+            .unwrap();
+
+        // Backdate row 1 past a 180-day window. Tests live inside the module,
+        // so we can reach the raw connection to fake the timestamp.
+        s.conn()
+            .execute(
+                "UPDATE seen_listings
+                 SET first_seen = datetime('now', '-200 days')
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        let pruned = s.prune_seen_older_than(180).unwrap();
+        assert_eq!(pruned, 1, "only the backdated row goes");
+        assert_eq!(s.seen_count().unwrap(), 1);
+        // The fresh row must still dedup.
+        assert!(s.unseen(&[listing(2, "fresh")]).unwrap().is_empty());
+        // The pruned row is now "new" again — the re-notification caveat.
+        assert_eq!(s.unseen(&[listing(1, "old")]).unwrap().len(), 1);
+
+        // Nothing left to prune; VACUUM must succeed on a live connection.
+        assert_eq!(s.prune_seen_older_than(180).unwrap(), 0);
+        s.vacuum().unwrap();
     }
 
     #[test]

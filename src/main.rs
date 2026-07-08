@@ -4,15 +4,9 @@
 //! spawn two concurrent tasks (poll loop and command listener), wait for
 //! either to finish. Both ends gracefully on SIGINT/SIGTERM via
 //! [`signals::shutdown_signal`].
-
-mod bot;
-mod commands;
-mod config;
-mod models;
-mod scraper;
-mod signals;
-mod storage;
-mod telegram;
+//!
+//! All modules live in the library crate (`src/lib.rs`) so integration
+//! tests can exercise them; this file only wires them together.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,13 +14,25 @@ use anyhow::{Context, Result};
 use tokio::sync::{Notify, RwLock};
 use tracing::{error, info};
 
-use crate::commands::CommandContext;
-use crate::config::{RuntimeConfig, StaticConfig};
-use crate::storage::Storage;
-use crate::telegram::TelegramClient;
+use njuska_auto_bot::commands::{self, CommandContext};
+use njuska_auto_bot::config::{RuntimeConfig, StaticConfig};
+use njuska_auto_bot::storage::Storage;
+use njuska_auto_bot::telegram::TelegramClient;
+use njuska_auto_bot::{bot, models, scraper, signals, version};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `--version` is the cheap startup path: print and exit before touching
+    // .env, tracing, or the database. Deployment scripts and the Debian
+    // smoke test rely on this working with zero configuration present.
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!("njuska_auto_bot {}", version::VERSION);
+        return Ok(());
+    }
+
     // Load .env first so RUST_LOG etc. are visible to tracing_subscriber below.
     // `.ok()` because a missing .env is fine in environments that inject env vars
     // directly (containers, systemd unit, CI).
@@ -34,7 +40,7 @@ async fn main() -> Result<()> {
 
     init_tracing();
 
-    info!("njuska_auto_bot starting");
+    info!(version = version::VERSION, "njuska_auto_bot starting");
 
     // Two-step config load: static first (everything we need to *open* storage,
     // including DB path), then runtime (which depends on storage being open
@@ -46,6 +52,34 @@ async fn main() -> Result<()> {
         dump_retention_days = static_cfg.dump_retention_days,
         "static config loaded"
     );
+
+    // Startup health-check through the CF Worker (#13). A dead proxy means
+    // the bot would sit in an endless 403 loop; better to find out *now*,
+    // loudly. 403 is a hard configuration error (secret mismatch) → refuse
+    // to start. Anything else (site down, transient network) is left to the
+    // poll loop's own retry/alert machinery — restart-looping the service
+    // because polovni had a bad minute would be worse.
+    if let Some(proxy) = &static_cfg.cf_proxy {
+        info!(url = %proxy.url, "probing CF Worker proxy before start");
+        match scraper::fetch_with_retries(&models::SearchFilter::default(), Some(proxy), 3).await {
+            Ok(_) => info!("CF Worker proxy probe OK"),
+            Err(scraper::ScraperError::Status(403)) => {
+                anyhow::bail!(
+                    "CF Worker proxy returned HTTP 403 — CF_PROXY_SECRET almost certainly \
+                     doesn't match the Worker's PROXY_SECRET. Fix: `wrangler secret put \
+                     PROXY_SECRET` on the Worker, then update CF_PROXY_SECRET in .env. \
+                     Refusing to start with a dead proxy."
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "CF Worker proxy probe failed (non-403); starting anyway — \
+                     the poll loop will retry and alert if it persists"
+                );
+            }
+        }
+    }
 
     let storage = Arc::new(Storage::new(&static_cfg.database_path).context("opening storage")?);
 
@@ -84,22 +118,19 @@ async fn main() -> Result<()> {
     let models_draft = Arc::new(Mutex::new(None));
 
     // ----- Spawn the poll loop -----
-    let poll_task = tokio::spawn({
+    // The tasks return their `Result` instead of swallowing it: main is the
+    // supervisor and needs to see *how* each one ended (#14).
+    let mut poll_task = tokio::spawn({
         let static_cfg = static_cfg.clone();
         let runtime = runtime.clone();
         let storage = storage.clone();
         let telegram = telegram.clone();
         let runtime_changed = runtime_changed.clone();
-        async move {
-            if let Err(e) = bot::run(static_cfg, runtime, storage, telegram, runtime_changed).await
-            {
-                error!(error = ?e, "poll loop exited with error");
-            }
-        }
+        async move { bot::run(static_cfg, runtime, storage, telegram, runtime_changed).await }
     });
 
     // ----- Spawn the command dispatcher -----
-    let cmd_task = tokio::spawn({
+    let mut cmd_task = tokio::spawn({
         // teloxide takes the `Bot` directly; we clone it out of our wrapper
         // (cheap — `Bot` is Arc-internal).
         let bot = telegram.bot();
@@ -112,20 +143,73 @@ async fn main() -> Result<()> {
             chassis_draft: chassis_draft.clone(),
             models_draft: models_draft.clone(),
         };
-        async move {
-            if let Err(e) = commands::run_command_loop(bot, ctx).await {
-                error!(error = ?e, "command loop exited with error");
-            }
-        }
+        async move { commands::run_command_loop(bot, ctx).await }
     });
 
-    // Both tasks subscribe to `shutdown_signal()` independently. On Ctrl+C /
-    // SIGTERM each one's `select!` resolves and they shut themselves down.
-    // We just wait for both to finish before returning from `main`.
-    let _ = tokio::join!(poll_task, cmd_task);
+    // Supervise: wait for whichever task finishes FIRST. On a clean
+    // SIGINT/SIGTERM both resolve Ok (each listens to shutdown_signal()
+    // independently). If one *dies* — Err or panic — we ask the survivor to
+    // shut down via the internal signal and exit non-zero so systemd
+    // (Restart=on-failure) restarts the whole process instead of leaving a
+    // half-alive bot running headless (#14).
+    //
+    // `&mut handle` in select! polls without consuming, so the not-yet-done
+    // handle can still be awaited below.
+    let (first_name, first_res) = tokio::select! {
+        r = &mut poll_task => ("poll loop", r),
+        r = &mut cmd_task => ("command dispatcher", r),
+    };
+    let first_failed = task_failed(first_name, first_res);
+    if first_failed {
+        signals::request_shutdown();
+    }
 
+    let (second_name, second_handle) = if first_name == "poll loop" {
+        ("command dispatcher", cmd_task)
+    } else {
+        ("poll loop", poll_task)
+    };
+    // Bounded wait: a poll cycle can legitimately take ~30s (curl timeout),
+    // so give the survivor a generous window before declaring it stuck.
+    const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+    let second_failed = match tokio::time::timeout(SHUTDOWN_GRACE, second_handle).await {
+        Ok(res) => task_failed(second_name, res),
+        Err(_elapsed) => {
+            error!(
+                task = second_name,
+                "task didn't stop within the shutdown grace period"
+            );
+            true
+        }
+    };
+
+    if first_failed || second_failed {
+        // Non-zero exit: anyhow's Err path prints the message and sets
+        // the process exit code to 1 — that's what systemd keys off.
+        anyhow::bail!("a background task died; exiting for systemd to restart us");
+    }
     info!("njuska_auto_bot exited cleanly");
     Ok(())
+}
+
+/// Logs how a supervised task ended and reports whether that counts as a
+/// failure. A `JoinError` means the task panicked (or was aborted — we never
+/// abort), which is just as fatal as a returned `Err`.
+fn task_failed(name: &str, res: Result<Result<()>, tokio::task::JoinError>) -> bool {
+    match res {
+        Ok(Ok(())) => {
+            info!(task = name, "task finished cleanly");
+            false
+        }
+        Ok(Err(e)) => {
+            error!(task = name, error = ?e, "task exited with error");
+            true
+        }
+        Err(join_err) => {
+            error!(task = name, error = ?join_err, "task panicked");
+            true
+        }
+    }
 }
 
 fn init_tracing() {

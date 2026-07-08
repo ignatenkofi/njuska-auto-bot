@@ -19,6 +19,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use tracing::warn;
 use url::Url;
 
 use crate::models::{SearchFilter, ShowOldNew};
@@ -66,9 +67,23 @@ pub struct StaticConfig {
     pub authorized_user_id: i64,
     pub save_raw_html: bool,
     pub zero_results_alert_threshold: u32,
+    /// Consecutive `fetch_search` failures before alerting to Telegram.
+    /// Parallel to `zero_results_alert_threshold` but for the *fetch* leg
+    /// (network, Cloudflare 403, proxy misconfig) rather than the parser.
+    pub fetch_errors_alert_threshold: u32,
     pub dumps_dir: PathBuf,
     /// Delete HTML dump folders older than this many days. `0` disables rotation.
     pub dump_retention_days: u32,
+    /// Cap on the *total* size of all HTML dumps, in MiB; oldest files are
+    /// deleted first once it's exceeded (checked after date rotation).
+    /// `0` disables the cap. Complements `dump_retention_days`: retention
+    /// bounds age, this bounds bytes — a short poll interval can produce a
+    /// lot of HTML within the retention window.
+    pub dump_max_total_mb: u64,
+    /// Delete `seen_listings` rows older than this many days (dedup memory).
+    /// `0` = keep forever. Default 180 (~6 months). See `.env.example` for
+    /// the re-notification caveat.
+    pub seen_retention_days: u32,
     /// Optional Cloudflare Worker proxy. When `Some`, all `polovniautomobili.com`
     /// fetches go through this Worker (which forwards them on CF's own
     /// infrastructure). Bypasses CF's direct-fetch challenge — needed when
@@ -113,8 +128,14 @@ impl std::fmt::Debug for StaticConfig {
                 "zero_results_alert_threshold",
                 &self.zero_results_alert_threshold,
             )
+            .field(
+                "fetch_errors_alert_threshold",
+                &self.fetch_errors_alert_threshold,
+            )
             .field("dumps_dir", &self.dumps_dir)
             .field("dump_retention_days", &self.dump_retention_days)
+            .field("dump_max_total_mb", &self.dump_max_total_mb)
+            .field("seen_retention_days", &self.seen_retention_days)
             .field("cf_proxy", &self.cf_proxy)
             .finish()
     }
@@ -130,10 +151,14 @@ impl StaticConfig {
             save_raw_html: opt_bool("SAVE_RAW_HTML")?.unwrap_or(true),
             zero_results_alert_threshold: opt_parsed::<u32>("ZERO_RESULTS_ALERT_THRESHOLD")?
                 .unwrap_or(3),
+            fetch_errors_alert_threshold: opt_parsed::<u32>("FETCH_ERRORS_ALERT_THRESHOLD")?
+                .unwrap_or(3),
             dumps_dir: opt_string("DUMPS_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./dumps")),
             dump_retention_days: opt_parsed::<u32>("DUMP_RETENTION_DAYS")?.unwrap_or(7),
+            dump_max_total_mb: opt_parsed::<u64>("DUMP_MAX_TOTAL_MB")?.unwrap_or(0),
+            seen_retention_days: opt_parsed::<u32>("SEEN_RETENTION_DAYS")?.unwrap_or(180),
             cf_proxy: load_cf_proxy()?,
         })
     }
@@ -202,7 +227,21 @@ impl RuntimeConfig {
                 Vec::new()
             } else {
                 s.split(',')
-                    .filter_map(|p| p.trim().parse::<u32>().ok())
+                    .filter_map(|p| {
+                        let part = p.trim();
+                        // A bad code in the DB (manual edit, older buggy
+                        // version) is dropped, but loudly (#29) — a silently
+                        // vanishing filter is maddening to debug.
+                        let parsed = part.parse::<u32>().ok();
+                        if parsed.is_none() {
+                            warn!(
+                                key = SETTING_SEARCH_CHASSIS,
+                                value = part,
+                                "ignoring unparseable chassis code in runtime_settings"
+                            );
+                        }
+                        parsed
+                    })
                     .collect()
             };
         }
@@ -223,24 +262,17 @@ impl RuntimeConfig {
 
         // For each range bound: empty string → `None` (explicitly cleared);
         // non-empty parseable → `Some(value)`; absent key → leave env value.
-        // The little helper closure keeps the four lookups uniform.
+        // The little helper closure keeps the four lookups uniform. Parse
+        // failures degrade to "no bound" but warn (#29).
         let bound_u32 = |key: &str| -> Result<Option<Option<u32>>> {
-            Ok(storage.get_setting(key)?.map(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    s.parse::<u32>().ok()
-                }
-            }))
+            Ok(storage
+                .get_setting(key)?
+                .map(|s| parse_stored_bound::<u32>(key, &s)))
         };
         let bound_u16 = |key: &str| -> Result<Option<Option<u16>>> {
-            Ok(storage.get_setting(key)?.map(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    s.parse::<u16>().ok()
-                }
-            }))
+            Ok(storage
+                .get_setting(key)?
+                .map(|s| parse_stored_bound::<u16>(key, &s)))
         };
 
         if let Some(v) = bound_u32(SETTING_SEARCH_PRICE_FROM)? {
@@ -257,18 +289,37 @@ impl RuntimeConfig {
         }
 
         let mut poll_interval = load_poll_interval()?;
-        if let Some(s) = storage.get_setting(SETTING_POLL_INTERVAL_SECS)?
-            && let Ok(secs) = s.parse::<u64>()
-            && secs >= MIN_POLL_INTERVAL_SECS
-        {
-            poll_interval = Duration::from_secs(secs);
+        if let Some(s) = storage.get_setting(SETTING_POLL_INTERVAL_SECS)? {
+            match s.parse::<u64>() {
+                Ok(secs) if secs >= MIN_POLL_INTERVAL_SECS => {
+                    poll_interval = Duration::from_secs(secs);
+                }
+                Ok(secs) => warn!(
+                    key = SETTING_POLL_INTERVAL_SECS,
+                    value = secs,
+                    min = MIN_POLL_INTERVAL_SECS,
+                    "stored poll interval below minimum; keeping env/default value"
+                ),
+                Err(_) => warn!(
+                    key = SETTING_POLL_INTERVAL_SECS,
+                    value = %s,
+                    "unparseable poll interval in runtime_settings; keeping env/default value"
+                ),
+            }
         }
 
         // `paused` is pure-runtime: no env knob, defaults to false.
-        let paused = storage
-            .get_setting(SETTING_PAUSED)?
-            .and_then(|s| s.parse::<bool>().ok())
-            .unwrap_or(false);
+        let paused = match storage.get_setting(SETTING_PAUSED)? {
+            Some(s) => s.parse::<bool>().unwrap_or_else(|_| {
+                warn!(
+                    key = SETTING_PAUSED,
+                    value = %s,
+                    "unparseable paused flag in runtime_settings; defaulting to false"
+                );
+                false
+            }),
+            None => false,
+        };
 
         Ok(Self {
             search,
@@ -281,6 +332,28 @@ impl RuntimeConfig {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Parses a stored range bound from `runtime_settings`. Empty string means
+/// "explicitly cleared" → `None`; a non-empty unparseable value also becomes
+/// `None` but logs a `warn!` (#29) so corrupt DB values don't silently drop
+/// a filter the user believes is active.
+fn parse_stored_bound<T>(key: &str, s: &str) -> Option<T>
+where
+    T: FromStr,
+{
+    if s.is_empty() {
+        return None;
+    }
+    let parsed = s.parse::<T>().ok();
+    if parsed.is_none() {
+        warn!(
+            key,
+            value = s,
+            "ignoring unparseable numeric bound in runtime_settings"
+        );
+    }
+    parsed
+}
 
 /// Hard floor: anything below a minute is impolite to the upstream site and
 /// serves no real purpose (listings don't appear that fast). Enforced in
@@ -420,6 +493,7 @@ fn opt_bool(key: &str) -> Result<Option<bool>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 
@@ -482,6 +556,16 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    #[test]
+    fn parse_stored_bound_handles_empty_garbage_and_valid() {
+        // Empty = explicitly cleared, no warning path.
+        assert_eq!(parse_stored_bound::<u32>("k", ""), None);
+        // Garbage degrades to None (and warns — not asserted here).
+        assert_eq!(parse_stored_bound::<u32>("k", "potato"), None);
+        // Valid parses through.
+        assert_eq!(parse_stored_bound::<u16>("k", "2015"), Some(2015));
     }
 
     #[test]

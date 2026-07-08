@@ -71,6 +71,51 @@ pub enum ScraperError {
     NotUtf8,
 }
 
+impl ScraperError {
+    /// True for failures a quick retry can plausibly fix: network-level curl
+    /// errors, rate limiting, server-side 5xx, and empty bodies. A 403
+    /// (Cloudflare challenge / wrong proxy secret) or a missing curl binary
+    /// won't get better by asking again a second later.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ScraperError::Curl { .. } | ScraperError::EmptyBody => true,
+            ScraperError::Status(s) => *s == 429 || (500..600).contains(s),
+            _ => false,
+        }
+    }
+}
+
+/// [`fetch_search`] wrapped in up-to-`attempts` tries with a short doubling
+/// backoff (1s, 2s, …) on *transient* errors only. Non-transient errors
+/// (403, malformed responses) return immediately — retrying those just
+/// delays the diagnosis.
+///
+/// Used by the startup proxy health-check (#13); `/diag` shares the same
+/// path with `attempts = 1` for a one-shot probe (#2).
+pub async fn fetch_with_retries(
+    filter: &SearchFilter,
+    proxy: Option<&ProxyConfig>,
+    attempts: u32,
+) -> Result<String, ScraperError> {
+    let attempts = attempts.max(1);
+    let mut delay = std::time::Duration::from_secs(1);
+    // The first `attempts - 1` tries may retry; the final one propagates
+    // whatever happens. Backoff stays tiny because callers (startup probe)
+    // want a verdict in seconds — the poll loop has its own long backoff.
+    for attempt in 1..attempts {
+        match fetch_search(filter, proxy).await {
+            Ok(html) => return Ok(html),
+            Err(e) if e.is_transient() => {
+                tracing::warn!(attempt, error = %e, "transient fetch error; retrying after backoff");
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    fetch_search(filter, proxy).await
+}
+
 /// Fetches the search-results page for the given filter and returns the raw HTML.
 ///
 /// **Implementation: shells out to system `curl`.** Why not `reqwest`?
@@ -130,15 +175,42 @@ pub async fn fetch_search(
         .arg("-w")
         .arg("%{stderr}%{http_code}"); // status code -> stderr, body -> stdout
 
-    // Authenticate to our Worker. Header value is treated as opaque on the
-    // CLI; no shell-escaping concerns since `secret` from env is alphanumeric.
-    if let Some(p) = proxy {
-        cmd.arg("-H").arg(format!("x-proxy-secret: {}", p.secret));
+    // Authenticate to our Worker. The secret travels as a curl *config file
+    // on stdin* (`--config -`), never on argv — /proc/<pid>/cmdline is
+    // world-readable, so `-H "x-proxy-secret: ..."` would leak it to every
+    // local process for the duration of the request (#21).
+    if proxy.is_some() {
+        cmd.arg("--config").arg("-");
+        cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
     }
 
     cmd.arg(request_url.as_str());
 
-    let output = cmd.output().await?;
+    // spawn + wait_with_output instead of `.output()` because we may need to
+    // write the config to stdin between the two. stdout/stderr must be piped
+    // explicitly — `.output()` did that for us, `.spawn()` doesn't.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    if let Some(p) = proxy {
+        use tokio::io::AsyncWriteExt;
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err(ScraperError::Spawn(std::io::Error::other(
+                "curl stdin was not piped",
+            )));
+        };
+        stdin
+            .write_all(proxy_secret_config(&p.secret).as_bytes())
+            .await?;
+        // Dropping the handle closes the pipe — curl needs the EOF to know
+        // the config is complete before it starts the transfer.
+        drop(stdin);
+    }
+
+    let output = child.wait_with_output().await?;
 
     // curl itself failed (network/TLS error, not HTTP error).
     if !output.status.success() {
@@ -168,6 +240,16 @@ pub async fn fetch_search(
     Ok(body)
 }
 
+/// Renders the `x-proxy-secret` header as one line of curl config-file
+/// syntax, for feeding via `--config -`. Inside curl's double-quoted config
+/// strings, backslash and the quote itself must be escaped — secrets are
+/// alphanumeric by convention, but a knob that breaks on exotic input is a
+/// footgun.
+fn proxy_secret_config(secret: &str) -> String {
+    let escaped = secret.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("header = \"x-proxy-secret: {escaped}\"\n")
+}
+
 // --- Selectors ---
 //
 // We parse each CSS selector exactly once and reuse it across calls.
@@ -179,14 +261,18 @@ pub async fn fetch_search(
 // constants — a panic means **we** wrote a bad selector and the test suite
 // catches it immediately, not at runtime in prod.
 
-static SEL_LISTING: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse("article.classified").expect("listing selector"));
-static SEL_TITLE_LINK: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse("h2 a.ga-title").expect("title selector"));
-static SEL_CITY: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse(".city").expect("city selector"));
-static SEL_INFO_TOP: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse(".info .setInfo .top").expect("info-top selector"));
+/// Parses a programmer-supplied CSS selector. Justified expect (see module
+/// comment above): the inputs are string constants; a bad one is caught by
+/// the first test run, never at runtime in prod.
+#[allow(clippy::expect_used)]
+fn sel(css: &str) -> Selector {
+    Selector::parse(css).expect("static selector must parse")
+}
+
+static SEL_LISTING: LazyLock<Selector> = LazyLock::new(|| sel("article.classified"));
+static SEL_TITLE_LINK: LazyLock<Selector> = LazyLock::new(|| sel("h2 a.ga-title"));
+static SEL_CITY: LazyLock<Selector> = LazyLock::new(|| sel(".city"));
+static SEL_INFO_TOP: LazyLock<Selector> = LazyLock::new(|| sel(".info .setInfo .top"));
 
 /// Parse all listings out of a search-results page.
 ///
@@ -306,6 +392,7 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 
@@ -395,5 +482,38 @@ mod tests {
         assert_eq!(parse_mileage_km("1.234.567 km"), Some(1_234_567));
         assert_eq!(parse_mileage_km("0 km"), Some(0));
         assert_eq!(parse_mileage_km("nepoznato"), None);
+    }
+
+    #[test]
+    fn proxy_secret_config_produces_curl_config_line_and_escapes_quoting() {
+        assert_eq!(
+            proxy_secret_config("s3cr3t"),
+            "header = \"x-proxy-secret: s3cr3t\"\n"
+        );
+        // Quote and backslash must be escaped per curl config quoting rules.
+        assert_eq!(
+            proxy_secret_config(r#"we"ird\one"#),
+            "header = \"x-proxy-secret: we\\\"ird\\\\one\"\n"
+        );
+    }
+
+    #[test]
+    fn transient_classification_retries_the_right_errors() {
+        // Retryable: network-level, rate limit, server errors, empty body.
+        assert!(
+            ScraperError::Curl {
+                exit: 28,
+                stderr: "timeout".into()
+            }
+            .is_transient()
+        );
+        assert!(ScraperError::Status(429).is_transient());
+        assert!(ScraperError::Status(502).is_transient());
+        assert!(ScraperError::EmptyBody.is_transient());
+        // Not retryable: CF challenge / auth problems and parse weirdness.
+        assert!(!ScraperError::Status(403).is_transient());
+        assert!(!ScraperError::Status(404).is_transient());
+        assert!(!ScraperError::MalformedStatus("x".into()).is_transient());
+        assert!(!ScraperError::NotUtf8.is_transient());
     }
 }

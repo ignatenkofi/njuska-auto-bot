@@ -62,6 +62,15 @@ teloxide = { version = "0.17", features = ["macros"] }
 # so they don't touch the real database file.
 tempfile = "3"
 
+# Project rule (CLAUDE.md): no unwrap/expect in production paths. Enforced by
+# the compiler rather than review vigilance (#23). The handful of justified
+# uses (poisoned-mutex expects, compile-time constants) carry an explicit
+# `#[allow]` with a why-comment; `#[cfg(test)]` modules and integration tests
+# are blanket-allowed — unwrap in tests is fine and keeps assertions terse.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
 [profile.release]
 # Smaller binary, slightly slower compile — fine for a long-running bot.
 lto = "thin"

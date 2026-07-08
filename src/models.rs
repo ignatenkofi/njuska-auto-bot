@@ -94,6 +94,10 @@ impl SearchFilter {
     ///
     /// Parameters that are `None`/empty are simply omitted — the site treats
     /// absent and empty filters as "no constraint", just like we want.
+    // Justified expect: SEARCH_URL is a compile-time constant; a parse
+    // failure is a typo the test suite catches immediately, not a runtime
+    // condition.
+    #[allow(clippy::expect_used)]
     pub fn to_url(&self) -> Url {
         let mut url = Url::parse(SEARCH_URL).expect("static search URL parses");
 
@@ -135,6 +139,7 @@ impl SearchFilter {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 

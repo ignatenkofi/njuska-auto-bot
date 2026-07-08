@@ -1,0 +1,28 @@
+# Dependabot: weekly dependency PRs, grouped so the repo gets ONE cargo PR
+# and ONE actions PR per week instead of a pile (#28). Security advisories
+# bypass the schedule and arrive immediately regardless.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    # One PR bundling every cargo bump. CI (fmt/clippy/tests + audit) is the
+    # gate; reviewing 15 lockfile PRs individually adds no safety.
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

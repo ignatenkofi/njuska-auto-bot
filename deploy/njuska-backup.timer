@@ -1,0 +1,17 @@
+# Daily trigger for njuska-backup.service (#19).
+#
+# Install: see the header of njuska-backup.service.
+
+[Unit]
+Description=Daily NjuskaAutoBot backup
+
+[Timer]
+# 04:30 local — after midnight rotation work, before anyone's awake.
+OnCalendar=*-*-* 04:30:00
+# If the VM was off at 04:30, run the missed backup on next boot.
+Persistent=true
+# Spread the exact start over a minute — polite on hosts with many timers.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

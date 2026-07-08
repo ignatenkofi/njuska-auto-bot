@@ -70,6 +70,7 @@ const INTERVAL_PRESETS: &[(u64, &str)] = &[
     (1800, "30 мин"),
     (3600, "1 час"),
     (7200, "2 часа"),
+    (86_400, "сутки"),
 ];
 
 /// Predefined price ranges, in EUR. `(from, to, display)` — `0` on either
@@ -461,6 +462,10 @@ pub enum Command {
     Dump(u32),
     #[command(description = "Пояснение: команд без режима не нужно отменять.")]
     Cancel,
+    #[command(description = "Разовая проверка фетча: сеть, прокси, парсер.")]
+    Diag,
+    #[command(description = "Версия бота (crate + git SHA).")]
+    Version,
 }
 
 /// How long after `/clear` a matching `/clear_confirm` is still accepted.
@@ -546,9 +551,11 @@ pub async fn run_command_loop(bot: Bot, ctx: CommandContext) -> Result<()> {
     tokio::select! {
         () = dispatcher.dispatch() => {
             // Dispatcher exited on its own — usually means a network error
-            // tearing down the long-poll. Logged as a warning; main will
-            // notice the task end and shut everything down.
+            // tearing down the long-poll. Returning Err (not Ok) lets main
+            // tell "task died" apart from "clean signal shutdown" and exit
+            // non-zero so systemd's Restart=on-failure kicks in (#14).
             warn!("command dispatcher exited unexpectedly");
+            return Err(anyhow::anyhow!("command dispatcher exited unexpectedly"));
         }
         _ = shutdown_signal() => {
             info!("command listener received shutdown signal");
@@ -612,6 +619,8 @@ async fn handle_command(
         Command::SetBrand(slug) => handle_set_brand(&ctx, slug).await,
         Command::Dump(n) => handle_dump(&ctx, n).await,
         Command::Cancel => format_cancel(),
+        Command::Diag => handle_diag(&ctx).await,
+        Command::Version => format!("🤖 NjuskaAutoBot <b>{}</b>", crate::version::VERSION),
     };
 
     bot.send_message(msg.chat.id, reply)
@@ -643,11 +652,18 @@ async fn format_status(ctx: &CommandContext) -> String {
 
     let count = ctx.storage.seen_count().unwrap_or(0);
 
+    // `Url` serialises query params percent-encoded, but `&` between pairs
+    // stays raw — Telegram's HTML parser chokes on a bare `&` inside an
+    // attribute, so it must become `&amp;` (issue #3).
+    let search_url = escape_html_attr_for_dump(search.to_url().as_str());
+
     format!(
         "<b>Текущая конфигурация</b>\n\n\
          {status_icon} Поллинг: <b>{status_text}</b>, интервал <b>{poll_interval_secs}</b> сек\n\n\
-         <b>Фильтры поиска</b>\n{filter}\n\n\
-         <b>База</b>: {count} объявлений в seen_listings",
+         <b>Фильтры поиска</b>\n{filter}\n\
+         🔗 <a href=\"{search_url}\">Открыть этот поиск на сайте</a>\n\n\
+         <b>База</b>: {count} объявлений в seen_listings\n\
+         <b>Версия</b>: <code>{version}</code>",
         status_icon = if paused { "⏸" } else { "▶️" },
         status_text = if paused {
             "на паузе"
@@ -655,6 +671,7 @@ async fn format_status(ctx: &CommandContext) -> String {
             "работает"
         },
         filter = format_filter_ru(&search),
+        version = crate::version::VERSION,
     )
 }
 
@@ -685,7 +702,7 @@ fn format_filter_ru(f: &SearchFilter) -> String {
         } else {
             f.chassis
                 .iter()
-                .map(u32::to_string)
+                .map(|c| chassis_label(*c))
                 .collect::<Vec<_>>()
                 .join(", ")
         }
@@ -705,6 +722,17 @@ fn format_filter_ru(f: &SearchFilter) -> String {
         if f.without_price { "да" } else { "нет" }
     ));
     lines.join("\n")
+}
+
+/// Reverse lookup: chassis code → human label from the [`CHASSIS`] catalog.
+/// Codes set via `SEARCH_CHASSIS` in `.env` may be outside the catalog —
+/// those render as the raw number so nothing is silently hidden (issue #4).
+fn chassis_label(code: u32) -> String {
+    CHASSIS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| code.to_string())
 }
 
 async fn handle_pause(ctx: &CommandContext) -> String {
@@ -778,34 +806,31 @@ async fn handle_dump(ctx: &CommandContext, n: u32) -> String {
     if listings.is_empty() {
         return "📋 База пустая — пока ничего не было сохранено.".into();
     }
+    format_dump_message(&listings, n)
+}
 
-    // Compact one-line-per-listing format — different from
-    // `telegram::format_listing_html` which is the per-card layout used for
-    // notifications. Here we want density.
-    let lines: Vec<String> = listings
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            let price = l.price_text.as_deref().unwrap_or("—");
-            let year = l.year.map(|y| y.to_string()).unwrap_or_else(|| "—".into());
-            let city = l.city.as_deref().unwrap_or("?");
-            format!(
-                "{n}. <a href=\"{url}\">{title}</a> — {price} · {year} · {city}",
-                n = i + 1,
-                url = escape_html_attr_for_dump(&l.url),
-                title = escape_html_text_for_dump(&l.title),
-                price = escape_html_text_for_dump(price),
-                year = year,
-                city = escape_html_text_for_dump(city),
-            )
-        })
-        .collect();
+/// Pure formatter behind `/dump` — separated from the handler so the
+/// budget/escaping behavior is unit-testable with adversarial data (#26).
+///
+/// Compact one-line-per-listing format (different from
+/// `telegram::format_listing_html`, the per-card notification layout).
+/// Two defenses against Telegram's 4096-char sendMessage limit:
+/// titles are hard-truncated, and lines stop (with a "… ещё N" note) once
+/// the running total approaches the limit — 25 normal listings fit, 25
+/// pathological ones degrade gracefully instead of triggering a 400.
+fn format_dump_message(listings: &[crate::models::Listing], requested: u32) -> String {
+    /// Telegram's hard cap on message length, in characters.
+    const TG_MESSAGE_LIMIT: usize = 4096;
+    /// Slack reserved for the "… ещё N" tail note.
+    const TAIL_RESERVE: usize = 64;
+    /// Titles longer than this (pre-escaping) get an ellipsis.
+    const MAX_TITLE_CHARS: usize = 120;
 
-    let header = if listings.len() < n as usize {
+    let header = if listings.len() < requested as usize {
         format!(
             "📋 Все <b>{}</b> объявлений в БД (запрошено {}):",
             listings.len(),
-            n
+            requested
         )
     } else {
         format!(
@@ -813,7 +838,91 @@ async fn handle_dump(ctx: &CommandContext, n: u32) -> String {
             listings.len()
         )
     };
-    format!("{header}\n\n{}", lines.join("\n"))
+
+    let mut out = header;
+    out.push('\n');
+    let mut used = out.chars().count();
+    for (i, l) in listings.iter().enumerate() {
+        let price = l.price_text.as_deref().unwrap_or("—");
+        let year = l.year.map(|y| y.to_string()).unwrap_or_else(|| "—".into());
+        let city = l.city.as_deref().unwrap_or("?");
+        let mut title: String = l.title.chars().take(MAX_TITLE_CHARS).collect();
+        if title.chars().count() < l.title.chars().count() {
+            title.push('…');
+        }
+        let line = format!(
+            "{n}. <a href=\"{url}\">{title}</a> — {price} · {year} · {city}",
+            n = i + 1,
+            url = escape_html_attr_for_dump(&l.url),
+            title = escape_html_text_for_dump(&title),
+            price = escape_html_text_for_dump(price),
+            year = year,
+            city = escape_html_text_for_dump(city),
+        );
+        let line_len = line.chars().count() + 1; // +1 for the newline
+        if used + line_len > TG_MESSAGE_LIMIT - TAIL_RESERVE {
+            out.push_str(&format!(
+                "\n… и ещё {} — не влезло в одно сообщение.",
+                listings.len() - i
+            ));
+            break;
+        }
+        out.push('\n');
+        out.push_str(&line);
+        used += line_len;
+    }
+    out
+}
+
+/// `/diag` — one-shot end-to-end fetch diagnostic (#2). Runs the exact same
+/// fetch + parse pipeline the poll loop uses (proxy included) and reports
+/// each leg in human terms, so "why is the bot quiet?" is answerable from
+/// the chat without ssh-ing into the box.
+async fn handle_diag(ctx: &CommandContext) -> String {
+    let search = ctx.runtime.read().await.search.clone();
+    let proxy = ctx.static_cfg.cf_proxy.as_ref();
+    let url = search.to_url();
+
+    let mut lines = vec![
+        "🩺 <b>Диагностика фетча</b>".to_string(),
+        format!(
+            "Прокси: <b>{}</b>",
+            if proxy.is_some() {
+                "настроен (CF Worker)"
+            } else {
+                "нет — прямой fetch"
+            }
+        ),
+        format!(
+            "URL: <code>{}</code>",
+            escape_html_text_for_dump(url.as_str())
+        ),
+    ];
+
+    // One-shot (attempts = 1): /diag reports the *current* state; retries
+    // would blur the picture. The startup health-check is the retrying user
+    // of the same helper.
+    match crate::scraper::fetch_with_retries(&search, proxy, 1).await {
+        Ok(html) => {
+            let listings = crate::scraper::parse_listings(&html);
+            lines.push(format!("HTTP: <b>2xx OK</b>, тело {} байт", html.len()));
+            lines.push(format!("Распарсено объявлений: <b>{}</b>", listings.len()));
+            lines.push(if listings.is_empty() {
+                "⚠️ 0 объявлений: либо фильтр слишком узкий, либо селекторы \
+                 устарели (проверь dumps)."
+                    .to_string()
+            } else {
+                "✅ Весь конвейер работает.".to_string()
+            });
+        }
+        Err(e) => {
+            lines.push(format!(
+                "❌ Фетч упал: {}",
+                escape_html_text_for_dump(&crate::bot::describe_fetch_error(&e, proxy.is_some()))
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Minimal HTML-attr escape for `/dump` URLs. We don't pull the helpers from
@@ -907,19 +1016,24 @@ async fn handle_resume(ctx: &CommandContext) -> String {
     "▶️ Поллинг возобновлён.".into()
 }
 
+/// Locks a `std::sync::Mutex`, treating poisoning as a bug to surface loudly
+/// (a previous holder panicked mid-update), not a runtime error to handle.
+/// Centralised so the justified `expect` lives in exactly one place — the
+/// crate denies `clippy::expect_used` everywhere else (#23).
+#[allow(clippy::expect_used)]
+fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().expect("mutex poisoned")
+}
+
 /// Two-step destructive op: `/clear` arms a pending state; `/clear_confirm`
 /// within [`CLEAR_CONFIRM_WINDOW`] actually wipes. Without this gate, a
 /// fat-finger near the input bar could nuke the whole dedup set.
 ///
 /// `handle_clear` is synchronous — we only touch the Mutex<Instant>, no I/O.
 fn handle_clear(ctx: &CommandContext) -> String {
-    // `expect("pending_clear mutex poisoned")` mirrors storage's stance:
-    // poisoning means a holder panicked, which is a bug to surface loudly,
-    // not a runtime error to handle.
-    let mut pending = ctx
-        .pending_clear
-        .lock()
-        .expect("pending_clear mutex poisoned");
+    // `lock_unpoisoned` mirrors storage's stance: poisoning means a holder
+    // panicked, which is a bug to surface loudly, not a runtime error.
+    let mut pending = lock_unpoisoned(&ctx.pending_clear);
     *pending = Some(Instant::now());
 
     let count = ctx.storage.seen_count().unwrap_or(0);
@@ -940,10 +1054,7 @@ async fn handle_clear_confirm(ctx: &CommandContext) -> String {
     // a failure here means a real DB problem the user needs to retry from
     // scratch, not auto-arm a second wipe attempt.
     let pending = {
-        let mut p = ctx
-            .pending_clear
-            .lock()
-            .expect("pending_clear mutex poisoned");
+        let mut p = lock_unpoisoned(&ctx.pending_clear);
         p.take()
     };
 
@@ -1032,12 +1143,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Returning to the menu always discards any in-flight picker
             // edits. "Back without saving" semantics belong here, central,
             // rather than duplicated in every picker's Back path.
-            *ctx.chassis_draft
-                .lock()
-                .expect("chassis_draft mutex poisoned") = None;
-            *ctx.models_draft
-                .lock()
-                .expect("models_draft mutex poisoned") = None;
+            *lock_unpoisoned(&ctx.chassis_draft) = None;
+            *lock_unpoisoned(&ctx.models_draft) = None;
 
             let (search, interval_secs) = {
                 let r = ctx.runtime.read().await;
@@ -1075,9 +1182,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Initialise draft = current runtime.chassis so the picker opens
             // with existing selections checked.
             let initial = ctx.runtime.read().await.search.chassis.clone();
-            *ctx.chassis_draft
-                .lock()
-                .expect("chassis_draft mutex poisoned") = Some(initial.clone());
+            *lock_unpoisoned(&ctx.chassis_draft) = Some(initial.clone());
             (
                 "Выбери типы кузова (можно несколько):".to_string(),
                 Some(chassis_picker_keyboard(&initial)),
@@ -1086,10 +1191,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
         CB_FILTER_CHASSIS_SAVE => {
             // Commit the draft to runtime + DB. The draft becomes the new
             // selection, even if empty (= "no chassis filter").
-            let draft = ctx
-                .chassis_draft
-                .lock()
-                .expect("chassis_draft mutex poisoned")
+            let draft = lock_unpoisoned(&ctx.chassis_draft)
                 .take()
                 .unwrap_or_default();
             apply_chassis(&ctx, draft).await;
@@ -1106,12 +1208,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Same "leave dialog" cleanup as CB_FILTER_MENU: discard any
             // hanging drafts. Without this, an abandoned picker edit would
             // sit in memory until the bot restarted.
-            *ctx.chassis_draft
-                .lock()
-                .expect("chassis_draft mutex poisoned") = None;
-            *ctx.models_draft
-                .lock()
-                .expect("models_draft mutex poisoned") = None;
+            *lock_unpoisoned(&ctx.chassis_draft) = None;
+            *lock_unpoisoned(&ctx.models_draft) = None;
 
             let search = ctx.runtime.read().await.search.clone();
             // Final state: text only, no keyboard. `markup = None` clears it.
@@ -1266,19 +1364,18 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 ),
                 Some(brand_slug) => match models_for_brand(&brand_slug) {
                     Some(model_list) => {
-                        *ctx.models_draft
-                            .lock()
-                            .expect("models_draft mutex poisoned") = Some(initial_models.clone());
+                        *lock_unpoisoned(&ctx.models_draft) = Some(initial_models.clone());
                         (
-                            format!("Модели для <b>{brand_slug}</b> (можно несколько):"),
+                            models_picker_title(&brand_slug),
                             Some(model_picker_keyboard(model_list, &initial_models)),
                         )
                     }
                     None => (
                         format!(
-                            "🤷 Для марки <code>{brand_slug}</code> у меня нет каталога моделей.\n\n\
+                            "🤷 Для марки <code>{}</code> у меня нет каталога моделей.\n\n\
                              Поставь модели через <code>SEARCH_MODEL</code> в <code>.env</code>, \
-                             либо смени марку через ✏️ Марка."
+                             либо смени марку через ✏️ Марка.",
+                            crate::telegram::escape_html(&brand_slug)
                         ),
                         Some(filter_menu_keyboard()),
                     ),
@@ -1286,10 +1383,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             }
         }
         CB_FILTER_MODELS_SAVE => {
-            let draft = ctx
-                .models_draft
-                .lock()
-                .expect("models_draft mutex poisoned")
+            let draft = lock_unpoisoned(&ctx.models_draft)
                 .take()
                 .unwrap_or_default();
             apply_models(&ctx, draft).await;
@@ -1318,10 +1412,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 return Ok(());
             };
             let new_state = {
-                let mut draft = ctx
-                    .models_draft
-                    .lock()
-                    .expect("models_draft mutex poisoned");
+                let mut draft = lock_unpoisoned(&ctx.models_draft);
                 let v = draft.get_or_insert_with(Vec::new);
                 if let Some(pos) = v.iter().position(|s| s == slug) {
                     v.remove(pos);
@@ -1331,7 +1422,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 v.clone()
             };
             (
-                format!("Модели для <b>{brand_slug}</b> (можно несколько):"),
+                models_picker_title(&brand_slug),
                 Some(model_picker_keyboard(model_list, &new_state)),
             )
         }
@@ -1343,10 +1434,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Toggle inside the lock, then take a snapshot for redraw —
             // never hold the Mutex past the lock scope.
             let new_state = {
-                let mut draft = ctx
-                    .chassis_draft
-                    .lock()
-                    .expect("chassis_draft mutex poisoned");
+                let mut draft = lock_unpoisoned(&ctx.chassis_draft);
                 let v = draft.get_or_insert_with(Vec::new);
                 if let Some(pos) = v.iter().position(|&x| x == code) {
                     v.remove(pos);
@@ -1709,6 +1797,17 @@ fn range_picker_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
+/// Title line of the model picker. Brand slugs from our catalog and the
+/// validated `/setbrand` path are tame, but `SEARCH_BRAND` in `.env` is
+/// free-form — escape rather than trust, or a slug like `a<b` would 400
+/// every picker render (#26).
+fn models_picker_title(brand_slug: &str) -> String {
+    format!(
+        "Модели для <b>{}</b> (можно несколько):",
+        crate::telegram::escape_html(brand_slug)
+    )
+}
+
 /// Model picker keyboard for a specific brand. Same multi-select shape as
 /// chassis (✓/⬜ prefixes, toggle callbacks, Save/Back row).
 ///
@@ -1806,4 +1905,141 @@ fn brand_picker_keyboard() -> InlineKeyboardMarkup {
         CB_FILTER_MENU,
     )]);
     InlineKeyboardMarkup::new(rows)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chassis_label_maps_known_codes_and_passes_through_unknown() {
+        assert_eq!(chassis_label(2634), "Кабриолет");
+        assert_eq!(chassis_label(2632), "Внедорожник");
+        // Not in the catalog (e.g. set via SEARCH_CHASSIS in .env) — raw code.
+        assert_eq!(chassis_label(9999), "9999");
+    }
+
+    #[test]
+    fn filter_summary_renders_chassis_as_labels() {
+        let f = SearchFilter {
+            chassis: vec![2634, 9999],
+            ..Default::default()
+        };
+        let s = format_filter_ru(&f);
+        assert!(s.contains("Кабриолет, 9999"), "{s}");
+    }
+
+    #[test]
+    fn status_search_url_is_html_escaped() {
+        // A multi-param filter produces `&` separators in the query string;
+        // inside Telegram HTML they must be escaped to `&amp;`.
+        let f = SearchFilter {
+            brand: Some("mini".into()),
+            models: vec!["cooper".into()],
+            ..Default::default()
+        };
+        let escaped = escape_html_attr_for_dump(f.to_url().as_str());
+        assert!(escaped.contains("&amp;"), "{escaped}");
+        // No bare `&` left: every `&` must start an entity we produced.
+        for (i, _) in escaped.match_indices('&') {
+            assert!(
+                escaped[i..].starts_with("&amp;")
+                    || escaped[i..].starts_with("&lt;")
+                    || escaped[i..].starts_with("&gt;")
+                    || escaped[i..].starts_with("&quot;"),
+                "bare & at {i} in {escaped}"
+            );
+        }
+    }
+
+    #[test]
+    fn models_picker_title_escapes_hostile_brand_slug() {
+        // SEARCH_BRAND in .env is free-form; a hostile/typo'd slug must not
+        // break the picker's HTML (#26).
+        let title = models_picker_title("a<b>&\"c");
+        assert!(title.contains("a&lt;b&gt;&amp;\"c"), "{title}");
+        assert!(!title.contains("<b>&"), "{title}");
+        // Sane slugs render unchanged.
+        assert!(models_picker_title("mini").contains("<b>mini</b>"));
+    }
+
+    fn dump_listing(id: u64, title: &str, url: &str) -> crate::models::Listing {
+        crate::models::Listing {
+            id,
+            title: title.into(),
+            url: url.into(),
+            price_text: Some("1.000 €".into()),
+            city: Some("Beograd".into()),
+            year: Some(2015),
+            mileage_km: Some(100_000),
+        }
+    }
+
+    #[test]
+    fn dump_message_normal_case_lists_everything_without_truncation() {
+        let listings: Vec<_> = (1..=25)
+            .map(|i| {
+                dump_listing(
+                    i,
+                    &format!("Car {i}"),
+                    &format!("https://example.com/auto-oglasi/{i}/car"),
+                )
+            })
+            .collect();
+        let msg = format_dump_message(&listings, 25);
+        assert!(msg.contains("25. "), "{msg}");
+        assert!(!msg.contains("не влезло"), "{msg}");
+        assert!(msg.chars().count() <= 4096);
+    }
+
+    #[test]
+    fn dump_message_stays_under_telegram_limit_with_monster_titles() {
+        // Adversarial: 25 listings with 500-char titles full of specials.
+        let monster = "α<>&\"🚗".repeat(84); // ~504 chars, multibyte + specials
+        let listings: Vec<_> = (1..=25)
+            .map(|i| {
+                dump_listing(
+                    i,
+                    &monster,
+                    &format!("https://example.com/auto-oglasi/{i}/x?a=1&b=\"2\""),
+                )
+            })
+            .collect();
+        let msg = format_dump_message(&listings, 25);
+        assert!(
+            msg.chars().count() <= 4096,
+            "must fit Telegram's limit, got {} chars",
+            msg.chars().count()
+        );
+        // Degrades gracefully: tail note instead of a 400 from Telegram.
+        assert!(msg.contains("не влезло"), "{msg}");
+        // Raw specials must never survive into element content.
+        assert!(!msg.contains("<>&"), "{msg}");
+        // Quotes in URLs must be entity-escaped inside href.
+        assert!(msg.contains("&quot;2&quot;"), "{msg}");
+    }
+
+    #[test]
+    fn dump_message_truncates_a_single_huge_title_but_keeps_the_line() {
+        let huge = "X".repeat(3000);
+        let listings = vec![dump_listing(1, &huge, "https://example.com/1")];
+        let msg = format_dump_message(&listings, 1);
+        assert!(msg.chars().count() <= 4096);
+        // Title capped with an ellipsis rather than dropping the listing.
+        assert!(msg.contains("X…"), "{msg}");
+        assert!(msg.contains("<a href="), "{msg}");
+    }
+
+    #[test]
+    fn dump_message_passes_rtl_and_zero_width_through_untouched() {
+        // RTL override and zero-width space are display-level nuisances, not
+        // HTML specials — escaping must not mangle them (Telegram renders
+        // them inert inside a link).
+        let sneaky = "BMW \u{202E}looc\u{200B} car";
+        let listings = vec![dump_listing(1, sneaky, "https://example.com/1")];
+        let msg = format_dump_message(&listings, 1);
+        assert!(msg.contains('\u{202E}'), "{msg}");
+        assert!(msg.contains('\u{200B}'), "{msg}");
+    }
 }

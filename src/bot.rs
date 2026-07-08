@@ -26,17 +26,28 @@ use crate::config::{RuntimeConfig, StaticConfig};
 use crate::scraper;
 use crate::signals::shutdown_signal;
 use crate::storage::Storage;
-use crate::telegram::{self, TelegramClient, TelegramError};
+use crate::telegram::{self, Notifier, TelegramClient, TelegramError};
 
 /// State that has to survive across cycles. Kept as a separate struct so we
 /// can hand it to a pure `update_streak` helper that's testable in isolation.
 #[derive(Default)]
-pub(crate) struct LoopState {
+pub struct LoopState {
     /// Consecutive cycles where `parse_listings` returned 0.
     zero_streak: u32,
     /// True once we've fired a TG alert for the current streak. Reset when
     /// the streak breaks. Prevents one outage from flooding the chat.
     streak_alerted: bool,
+    /// Consecutive cycles where `fetch_search` itself failed (network, CF
+    /// 403, curl error). Parallel to `zero_streak` but one step earlier in
+    /// the pipeline — a broken *fetch* also deserves an alert (#12), and it
+    /// stretches the effective sleep (see [`effective_sleep`]).
+    fetch_error_streak: u32,
+    /// Same one-alert-per-streak latch as `streak_alerted`.
+    fetch_error_alerted: bool,
+    /// Day the last DB maintenance (retention prune + VACUUM) ran, so it
+    /// happens once per calendar day regardless of poll cadence (#17).
+    /// `None` on startup — the first cycle always runs maintenance.
+    last_maintenance: Option<NaiveDate>,
 }
 
 /// The main entrypoint. Returns when Ctrl+C / SIGTERM is received (or never,
@@ -80,10 +91,29 @@ pub async fn run(
         "poll loop started; send SIGINT (Ctrl+C) or SIGTERM to stop"
     );
 
+    // Production fetch seam: the real scraper, routed through the proxy when
+    // configured. Takes the filter by value (and clones the proxy config —
+    // a Url + String, pennies) so the returned future owns everything it
+    // touches; borrowing through a generic `Fn` would force higher-ranked
+    // lifetimes on every caller for zero benefit.
+    let cf_proxy = static_cfg.cf_proxy.clone();
+    let fetch = move |filter: crate::models::SearchFilter| {
+        let proxy = cf_proxy.clone();
+        async move { scraper::fetch_search(&filter, proxy.as_ref()).await }
+    };
+
     loop {
         // Run a cycle first — so we poll immediately on bot startup, not
         // after waiting an interval.
-        if let Err(e) = run_one_cycle(&static_cfg, &runtime, &storage, &telegram, &mut state).await
+        if let Err(e) = run_one_cycle(
+            &static_cfg,
+            &runtime,
+            &storage,
+            &telegram,
+            &mut state,
+            &fetch,
+        )
+        .await
         {
             // The cycle's own error path is `warn!` / `error!`; this catches
             // `?` propagations from places we couldn't recover. The loop
@@ -93,7 +123,17 @@ pub async fn run(
 
         // Sleep until: the configured interval elapses, OR /interval changes
         // the interval, OR a shutdown signal arrives. Whichever comes first.
-        let sleep_dur = runtime.read().await.poll_interval;
+        // A growing fetch-error streak stretches the sleep (capped at 4x) so
+        // we don't hammer a site or proxy that's actively rejecting us.
+        let base_interval = runtime.read().await.poll_interval;
+        let sleep_dur = effective_sleep(base_interval, state.fetch_error_streak);
+        if sleep_dur > base_interval {
+            warn!(
+                streak = state.fetch_error_streak,
+                sleep_secs = sleep_dur.as_secs(),
+                "stretching sleep due to fetch-error streak"
+            );
+        }
         tokio::select! {
             _ = tokio::time::sleep(sleep_dur) => {}
             _ = runtime_changed.notified() => {
@@ -110,13 +150,32 @@ pub async fn run(
 /// it does **not** stop the loop. Most error paths inside this function
 /// instead log at `warn!`/`error!` and continue, so the cycle completes
 /// even when one sub-step fails.
-async fn run_one_cycle(
+///
+/// `pub` with two injected seams (#22) so `tests/poll_cycle.rs` can run the
+/// real cycle — dedup, mark-after-send, streak bookkeeping — against a
+/// fixture and a collector instead of live HTTP:
+///
+/// * `fetch` — anything `SearchFilter -> Future<Result<String, ScraperError>>`.
+///   Production passes a closure over [`scraper::fetch_search`].
+/// * `notifier` — the outbound-send seam ([`Notifier`]); production is the
+///   real [`TelegramClient`].
+pub async fn run_one_cycle<N, F, Fut>(
     static_cfg: &StaticConfig,
     runtime: &Arc<RwLock<RuntimeConfig>>,
     storage: &Storage,
-    telegram: &TelegramClient,
+    notifier: &N,
     state: &mut LoopState,
-) -> Result<()> {
+    fetch: &F,
+) -> Result<()>
+where
+    N: Notifier,
+    F: Fn(crate::models::SearchFilter) -> Fut,
+    Fut: std::future::Future<Output = Result<String, scraper::ScraperError>>,
+{
+    // DB maintenance first, *before* the pause check — a bot paused for a
+    // month should still honor the retention policy.
+    maybe_run_daily_maintenance(static_cfg, storage, state);
+
     // Snapshot what we need under a brief read lock. We deliberately don't
     // hold the lock across any `.await` — the cycle takes ~1s incl. HTTP,
     // and a writer (a `/pause` command) blocked for 1s on every cycle would
@@ -131,14 +190,37 @@ async fn run_one_cycle(
         return Ok(());
     }
 
-    let html = match scraper::fetch_search(&search, static_cfg.cf_proxy.as_ref()).await {
-        Ok(h) => h,
+    let html = match fetch(search).await {
+        Ok(h) => {
+            // Fetch works again — clear the error streak and re-arm the alert.
+            update_fetch_error_streak(state, false, static_cfg.fetch_errors_alert_threshold);
+            h
+        }
         Err(e) => {
-            // Fetch failures (CF blocked us, network blip, curl bug) are
-            // *transient* by nature — they're not the "parser broken" signal
-            // we want the zero-streak detector to react to. So we don't
-            // touch the streak counter here. Just log and bail this cycle.
-            warn!(error = %e, "fetch failed; will retry next cycle");
+            // Fetch failures are usually transient (network blip) so they're
+            // kept out of the zero-streak/parser detector. But a *persistent*
+            // fetch failure (dead proxy, rotated CF_PROXY_SECRET, CF blocking
+            // us) won't fix itself either — that gets its own streak counter
+            // and a one-off Telegram alert per streak (#12).
+            warn!(
+                error = %e,
+                streak = state.fetch_error_streak + 1,
+                "fetch failed; will retry next cycle"
+            );
+            if update_fetch_error_streak(state, true, static_cfg.fetch_errors_alert_threshold) {
+                let alert = format!(
+                    "⚠️ <b>NjuskaAutoBot alert</b>\n\n\
+                     Fetching the search page failed <b>{}</b> times in a row.\n\
+                     Last error: {}",
+                    state.fetch_error_streak,
+                    telegram::escape_html(&describe_fetch_error(&e, static_cfg.cf_proxy.is_some())),
+                );
+                if let Err(send_err) = notifier.send_html(&alert).await {
+                    warn!(error = %send_err, "couldn't send fetch-error alert");
+                } else {
+                    state.fetch_error_alerted = true;
+                }
+            }
             return Ok(());
         }
     };
@@ -155,6 +237,17 @@ async fn run_one_cycle(
         {
             warn!(error = %e, "couldn't rotate old HTML dumps");
         }
+        // Size cap runs *after* date rotation so it only has to clean up
+        // what retention left behind (#16).
+        if static_cfg.dump_max_total_mb > 0
+            && let Err(e) = enforce_dump_size_cap(
+                &static_cfg.dumps_dir,
+                static_cfg.dump_max_total_mb * 1024 * 1024,
+            )
+            .await
+        {
+            warn!(error = %e, "couldn't enforce dump size cap");
+        }
     }
 
     let listings = scraper::parse_listings(&html);
@@ -165,7 +258,7 @@ async fn run_one_cycle(
         listings.is_empty(),
         static_cfg.zero_results_alert_threshold,
     ) {
-        if let Err(e) = telegram.send_message(&alert).await {
+        if let Err(e) = notifier.send_html(&alert).await {
             warn!(error = %e, "couldn't send zero-streak alert");
         } else {
             state.streak_alerted = true;
@@ -183,7 +276,7 @@ async fn run_one_cycle(
         "cycle parsed"
     );
 
-    let sent = send_batch(telegram, &unseen).await;
+    let sent = send_batch(notifier, &unseen).await;
     let attempted = unseen.len();
     let sent_count = sent.len();
     storage
@@ -233,6 +326,62 @@ fn update_streak(state: &mut LoopState, listings_empty: bool, threshold: u32) ->
     }
 }
 
+/// Pure state machine for the fetch-error streak, mirroring [`update_streak`].
+/// Returns `true` when the caller should fire the alert *now* (threshold hit
+/// and not yet alerted for this streak). The caller flips
+/// `fetch_error_alerted` after a successful send — same contract as the
+/// zero-streak path.
+fn update_fetch_error_streak(state: &mut LoopState, fetch_failed: bool, threshold: u32) -> bool {
+    if fetch_failed {
+        state.fetch_error_streak += 1;
+        state.fetch_error_streak >= threshold && !state.fetch_error_alerted
+    } else {
+        if state.fetch_error_streak > 0 {
+            info!(
+                previous_streak = state.fetch_error_streak,
+                "fetch recovered; error streak cleared"
+            );
+        }
+        state.fetch_error_streak = 0;
+        state.fetch_error_alerted = false;
+        false
+    }
+}
+
+/// How long to actually sleep given the configured interval and the current
+/// fetch-error streak: 1x, 2x, then capped at 4x. Pure so the doubling/cap
+/// policy is unit-testable without a runtime.
+fn effective_sleep(base: std::time::Duration, error_streak: u32) -> std::time::Duration {
+    let factor = match error_streak {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    };
+    base * factor
+}
+
+/// Human-readable one-liner for a fetch failure, used in the Telegram alert
+/// and by `/diag`. The 403-through-proxy case gets a targeted hint because
+/// it's almost always a rotated/mismatched `CF_PROXY_SECRET`.
+pub(crate) fn describe_fetch_error(e: &scraper::ScraperError, via_proxy: bool) -> String {
+    use crate::scraper::ScraperError;
+    match e {
+        ScraperError::Status(403) if via_proxy => "HTTP 403 through the CF Worker proxy — \
+             check that CF_PROXY_SECRET matches the Worker's PROXY_SECRET \
+             (wrangler secret put PROXY_SECRET)"
+            .to_string(),
+        ScraperError::Status(403) => "HTTP 403 — Cloudflare is challenging direct fetches; \
+             consider the CF Worker proxy (see cf-proxy/README.md)"
+            .to_string(),
+        ScraperError::Status(s) => format!("non-success HTTP status {s}"),
+        ScraperError::Curl { exit, .. } => {
+            format!("curl failed with exit code {exit} (network/DNS/TLS-level error)")
+        }
+        ScraperError::Spawn(io) => format!("couldn't run curl: {io}"),
+        other => other.to_string(),
+    }
+}
+
 /// Sends each new listing to Telegram. Returns the listings that **successfully**
 /// went through — caller is responsible for marking those as seen.
 ///
@@ -240,26 +389,31 @@ fn update_streak(state: &mut LoopState, listings_empty: bool, threshold: u32) ->
 /// silently dropped from the returned slice — they'll re-appear in the next
 /// cycle's `unseen` set and we'll retry them then.
 ///
-/// On a 429 we sleep for the server-supplied `retry_after` and retry the
-/// same message **once**. If the retry also fails (429 again or otherwise),
-/// we log and stop the batch — the next cycle (in `poll_interval`) picks
-/// up where we left off, by which point any rate-limit window has expired.
+/// Retry policy per error class (#15):
 ///
-/// Cap on sleep: Telegram has been known to suggest very large `retry_after`
-/// values for "spam-flagged" bots. We clamp to 60s so a misconfigured run
-/// can't freeze the cycle for half an hour.
-async fn send_batch(
-    telegram: &TelegramClient,
+/// * **429** — sleep the server-supplied `retry_after` (clamped to 60s;
+///   Telegram has been known to suggest huge values for spam-flagged bots)
+///   and retry **once**. A second failure stops the batch — the next cycle
+///   picks up where we left off, past any rate-limit window.
+/// * **Retryable** (network/5xx/garbled response) — sleep a short fixed
+///   backoff and retry **once**. A second failure also stops the batch:
+///   if the network is down, every remaining send would fail too.
+/// * **Permanent** (400 bad request, …) — logged at `error!` and never
+///   retried; the payload won't get better by resending it.
+async fn send_batch<N: Notifier>(
+    notifier: &N,
     listings: &[crate::models::Listing],
 ) -> Vec<crate::models::Listing> {
     /// Hard ceiling on how long we'll sleep waiting out a 429.
     const MAX_BACKOFF_SECS: u64 = 60;
+    /// Fixed pause before retrying a transport-level failure.
+    const RETRYABLE_BACKOFF_SECS: u64 = 3;
 
     let mut sent: Vec<crate::models::Listing> = Vec::with_capacity(listings.len());
 
     for l in listings {
         let text = telegram::format_listing_html(l);
-        match telegram.send_message(&text).await {
+        match notifier.send_html(&text).await {
             Ok(()) => {
                 info!(id = l.id, title = %l.title, "sent");
                 sent.push(l.clone());
@@ -274,7 +428,7 @@ async fn send_batch(
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
 
-                match telegram.send_message(&text).await {
+                match notifier.send_html(&text).await {
                     Ok(()) => {
                         info!(id = l.id, title = %l.title, "sent (after 429 retry)");
                         sent.push(l.clone());
@@ -289,8 +443,35 @@ async fn send_batch(
                     }
                 }
             }
-            Err(e) => {
-                warn!(id = l.id, error = %e, "telegram send failed");
+            Err(TelegramError::Retryable(e)) => {
+                warn!(
+                    id = l.id,
+                    error = %e,
+                    backoff_secs = RETRYABLE_BACKOFF_SECS,
+                    "transient telegram send failure; retrying once"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(RETRYABLE_BACKOFF_SECS)).await;
+
+                match notifier.send_html(&text).await {
+                    Ok(()) => {
+                        info!(id = l.id, title = %l.title, "sent (after transient-error retry)");
+                        sent.push(l.clone());
+                    }
+                    Err(retry_err) => {
+                        warn!(
+                            id = l.id,
+                            error = %retry_err,
+                            "retry after transient error still failed; stopping batch"
+                        );
+                        break;
+                    }
+                }
+            }
+            Err(e @ TelegramError::Permanent(_)) => {
+                // error!, not warn!: a permanent rejection (usually 400 from
+                // bad HTML in the payload) is a bug in our formatting, not
+                // weather. It will recur every cycle until someone looks.
+                error!(id = l.id, error = %e, "permanent telegram send failure; not retrying");
             }
         }
     }
@@ -349,7 +530,134 @@ async fn rotate_dumps(dumps_dir: &Path, retention_days: u32) -> std::io::Result<
     Ok(())
 }
 
+/// Once-a-day DB housekeeping (#17): prune `seen_listings` rows older than
+/// the retention window, then `VACUUM` so the file actually shrinks.
+///
+/// Synchronous on purpose — both operations are sub-millisecond at our row
+/// counts (see the module docs in `storage.rs` on sync rusqlite under tokio).
+/// Errors are logged, never propagated: a failed VACUUM must not cost us a
+/// poll cycle. We stamp `last_maintenance` *before* doing the work so a
+/// persistent failure retries tomorrow, not every 10 minutes all day.
+fn maybe_run_daily_maintenance(
+    static_cfg: &StaticConfig,
+    storage: &Storage,
+    state: &mut LoopState,
+) {
+    let today = Local::now().date_naive();
+    if state.last_maintenance == Some(today) {
+        return;
+    }
+    state.last_maintenance = Some(today);
+
+    if static_cfg.seen_retention_days > 0 {
+        match storage.prune_seen_older_than(static_cfg.seen_retention_days) {
+            Ok(0) => debug!("retention prune: nothing to remove"),
+            Ok(n) => info!(
+                pruned = n,
+                retention_days = static_cfg.seen_retention_days,
+                "pruned old seen_listings rows"
+            ),
+            Err(e) => warn!(error = %e, "couldn't prune seen_listings"),
+        }
+    }
+
+    if let Err(e) = storage.vacuum() {
+        warn!(error = %e, "daily VACUUM failed");
+    } else {
+        debug!("daily VACUUM done");
+    }
+}
+
+/// Keeps the total size of all HTML dumps under `max_total_bytes` by deleting
+/// the **oldest files first** (#16). Ordering comes for free from the layout
+/// [`save_html_dump`] writes: day folders sort by date, files inside by
+/// `HHMMSS` name. Day folders emptied by the sweep are removed too.
+///
+/// Files-first (rather than dropping whole day folders) so a single heavy day
+/// can't force deleting *today's* dumps wholesale — we trim from the back
+/// until we fit.
+async fn enforce_dump_size_cap(dumps_dir: &Path, max_total_bytes: u64) -> std::io::Result<()> {
+    // Missing dir = nothing dumped yet = nothing to cap.
+    let mut entries = match tokio::fs::read_dir(dumps_dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    // Day folders, oldest first. Non-date folders are none of our business —
+    // same stance as rotate_dumps.
+    let mut day_dirs: Vec<(NaiveDate, std::path::PathBuf)> = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(d) = NaiveDate::parse_from_str(name_str, "%Y-%m-%d") else {
+            continue;
+        };
+        day_dirs.push((d, entry.path()));
+    }
+    day_dirs.sort();
+
+    // Every dump file with its size, oldest first.
+    let mut files: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    for (_, dir) in &day_dirs {
+        let mut in_dir: Vec<(std::ffi::OsString, std::path::PathBuf, u64)> = Vec::new();
+        let mut rd = tokio::fs::read_dir(dir).await?;
+        while let Some(f) = rd.next_entry().await? {
+            if !f.file_type().await?.is_file() {
+                continue;
+            }
+            let len = f.metadata().await?.len();
+            in_dir.push((f.file_name(), f.path(), len));
+        }
+        // read_dir order is unspecified; HHMMSS names sort chronologically.
+        in_dir.sort();
+        for (_, path, len) in in_dir {
+            total += len;
+            files.push((path, len));
+        }
+    }
+
+    if total <= max_total_bytes {
+        return Ok(());
+    }
+
+    let mut freed: u64 = 0;
+    let mut deleted: u32 = 0;
+    for (path, len) in files {
+        if total - freed <= max_total_bytes {
+            break;
+        }
+        tokio::fs::remove_file(&path).await?;
+        freed += len;
+        deleted += 1;
+    }
+
+    // Sweep away day folders the deletion emptied.
+    for (_, dir) in &day_dirs {
+        let mut rd = tokio::fs::read_dir(dir).await?;
+        if rd.next_entry().await?.is_none() {
+            tokio::fs::remove_dir(dir).await?;
+        }
+    }
+
+    info!(
+        deleted_files = deleted,
+        freed_bytes = freed,
+        total_before = total,
+        cap_bytes = max_total_bytes,
+        "dump size cap enforced"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
 
@@ -410,6 +718,61 @@ mod tests {
         assert!(next_alert.is_some(), "next streak should re-alert");
     }
 
+    #[test]
+    fn fetch_error_streak_alerts_once_at_threshold_and_resets_on_success() {
+        let mut s = LoopState::default();
+
+        // Below threshold: no alert.
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+        // At threshold: alert requested.
+        assert!(update_fetch_error_streak(&mut s, true, 3));
+        assert_eq!(s.fetch_error_streak, 3);
+
+        // Simulate the caller's success-side bookkeeping after sending.
+        s.fetch_error_alerted = true;
+        // Same streak: no re-alerts.
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+
+        // Success resets streak and re-arms.
+        assert!(!update_fetch_error_streak(&mut s, false, 3));
+        assert_eq!(s.fetch_error_streak, 0);
+        assert!(!s.fetch_error_alerted);
+
+        // A fresh streak alerts again once it reaches the threshold.
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+        assert!(update_fetch_error_streak(&mut s, true, 3));
+    }
+
+    #[test]
+    fn effective_sleep_doubles_then_caps_at_4x() {
+        let base = std::time::Duration::from_secs(600);
+        assert_eq!(effective_sleep(base, 0), base);
+        assert_eq!(effective_sleep(base, 1), base * 2);
+        assert_eq!(effective_sleep(base, 2), base * 4);
+        assert_eq!(effective_sleep(base, 3), base * 4, "capped at 4x");
+        assert_eq!(effective_sleep(base, 100), base * 4, "capped at 4x");
+    }
+
+    #[test]
+    fn describe_fetch_error_hints_at_proxy_secret_on_403_via_proxy() {
+        use crate::scraper::ScraperError;
+
+        let with_proxy = describe_fetch_error(&ScraperError::Status(403), true);
+        assert!(with_proxy.contains("CF_PROXY_SECRET"), "{with_proxy}");
+
+        let without_proxy = describe_fetch_error(&ScraperError::Status(403), false);
+        assert!(
+            !without_proxy.contains("CF_PROXY_SECRET"),
+            "{without_proxy}"
+        );
+        assert!(without_proxy.contains("403"), "{without_proxy}");
+
+        let plain = describe_fetch_error(&ScraperError::Status(500), true);
+        assert!(plain.contains("500"), "{plain}");
+    }
+
     #[tokio::test]
     async fn rotate_dumps_drops_old_folders_and_keeps_recent_and_unparseable() {
         let dir = tempfile::tempdir().unwrap();
@@ -450,6 +813,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("never_existed");
         rotate_dumps(&missing, 7).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn size_cap_deletes_oldest_files_first_and_sweeps_empty_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Three day folders, two 100-byte files each; oldest day first.
+        let mk = |day: &str, file: &str| {
+            let d = root.join(day);
+            std::fs::create_dir_all(&d).unwrap();
+            let p = d.join(file);
+            std::fs::write(&p, [b'x'; 100]).unwrap();
+            p
+        };
+        let old_a = mk("2026-07-01", "080000.html");
+        let old_b = mk("2026-07-01", "090000.html");
+        let mid_a = mk("2026-07-02", "080000.html");
+        let mid_b = mk("2026-07-02", "090000.html");
+        let new_a = mk("2026-07-03", "080000.html");
+        let new_b = mk("2026-07-03", "090000.html");
+        // A non-date folder must be left strictly alone, whatever its size.
+        let other = root.join("notes");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("big.txt"), [b'x'; 10_000]).unwrap();
+
+        // Total dump size = 600; cap at 350 -> the three oldest files
+        // (100 each) must go, freeing down to 300.
+        enforce_dump_size_cap(root, 350).await.unwrap();
+
+        assert!(!old_a.exists(), "oldest file must be deleted first");
+        assert!(!old_b.exists(), "second-oldest must be deleted");
+        assert!(!mid_a.exists(), "third-oldest must be deleted");
+        assert!(mid_b.exists(), "must stop once under the cap");
+        assert!(new_a.exists());
+        assert!(new_b.exists());
+        // The emptied oldest day folder disappears; the half-full one stays.
+        assert!(!root.join("2026-07-01").exists(), "emptied dir swept");
+        assert!(root.join("2026-07-02").exists());
+        assert!(other.exists(), "non-date folder untouched");
+        assert!(other.join("big.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn size_cap_is_a_noop_under_the_limit_and_on_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Missing dir: fine.
+        enforce_dump_size_cap(&root.join("never_existed"), 1)
+            .await
+            .unwrap();
+
+        // Under the cap: nothing deleted.
+        let d = root.join("2026-07-03");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("080000.html");
+        std::fs::write(&f, "small").unwrap();
+        enforce_dump_size_cap(root, 1024).await.unwrap();
+        assert!(f.exists());
     }
 
     #[tokio::test]
