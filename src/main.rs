@@ -59,6 +59,34 @@ async fn main() -> Result<()> {
         "static config loaded"
     );
 
+    // Startup health-check through the CF Worker (#13). A dead proxy means
+    // the bot would sit in an endless 403 loop; better to find out *now*,
+    // loudly. 403 is a hard configuration error (secret mismatch) → refuse
+    // to start. Anything else (site down, transient network) is left to the
+    // poll loop's own retry/alert machinery — restart-looping the service
+    // because polovni had a bad minute would be worse.
+    if let Some(proxy) = &static_cfg.cf_proxy {
+        info!(url = %proxy.url, "probing CF Worker proxy before start");
+        match scraper::fetch_with_retries(&models::SearchFilter::default(), Some(proxy), 3).await {
+            Ok(_) => info!("CF Worker proxy probe OK"),
+            Err(scraper::ScraperError::Status(403)) => {
+                anyhow::bail!(
+                    "CF Worker proxy returned HTTP 403 — CF_PROXY_SECRET almost certainly \
+                     doesn't match the Worker's PROXY_SECRET. Fix: `wrangler secret put \
+                     PROXY_SECRET` on the Worker, then update CF_PROXY_SECRET in .env. \
+                     Refusing to start with a dead proxy."
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "CF Worker proxy probe failed (non-403); starting anyway — \
+                     the poll loop will retry and alert if it persists"
+                );
+            }
+        }
+    }
+
     let storage = Arc::new(Storage::new(&static_cfg.database_path).context("opening storage")?);
 
     let runtime_initial = RuntimeConfig::load(&storage).context("loading runtime config")?;
