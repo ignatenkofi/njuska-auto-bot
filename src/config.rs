@@ -62,9 +62,11 @@ pub struct StaticConfig {
     pub database_path: PathBuf,
     pub telegram_token: String,
     pub telegram_chat_id: i64,
-    /// Telegram user-id authorised to send commands. Other users' messages
-    /// are logged and dropped.
-    pub authorized_user_id: i64,
+    /// Telegram user-ids authorised to send commands (#9) — a small group
+    /// (family / co-renters) can share the bot. `AUTHORIZED_USER_ID` accepts
+    /// a comma-separated list; a single id keeps working. Other users'
+    /// messages are logged and dropped. Never empty — enforced at load.
+    pub authorized_user_ids: Vec<i64>,
     pub save_raw_html: bool,
     pub zero_results_alert_threshold: u32,
     /// Consecutive `fetch_search` failures before alerting to Telegram.
@@ -122,7 +124,7 @@ impl std::fmt::Debug for StaticConfig {
             .field("database_path", &self.database_path)
             .field("telegram_token", &"<redacted>")
             .field("telegram_chat_id", &self.telegram_chat_id)
-            .field("authorized_user_id", &self.authorized_user_id)
+            .field("authorized_user_ids", &self.authorized_user_ids)
             .field("save_raw_html", &self.save_raw_html)
             .field(
                 "zero_results_alert_threshold",
@@ -147,7 +149,7 @@ impl StaticConfig {
             database_path: load_database_path(),
             telegram_token: req_string("TELEGRAM_BOT_TOKEN")?,
             telegram_chat_id: req_parsed::<i64>("TELEGRAM_CHAT_ID")?,
-            authorized_user_id: req_parsed::<i64>("AUTHORIZED_USER_ID")?,
+            authorized_user_ids: req_csv_parsed::<i64>("AUTHORIZED_USER_ID")?,
             save_raw_html: opt_bool("SAVE_RAW_HTML")?.unwrap_or(true),
             zero_results_alert_threshold: opt_parsed::<u32>("ZERO_RESULTS_ALERT_THRESHOLD")?
                 .unwrap_or(3),
@@ -161,6 +163,12 @@ impl StaticConfig {
             seen_retention_days: opt_parsed::<u32>("SEEN_RETENTION_DAYS")?.unwrap_or(180),
             cf_proxy: load_cf_proxy()?,
         })
+    }
+
+    /// Whether this Telegram user-id may issue commands. Linear scan — the
+    /// list is a handful of family members, not a user base.
+    pub fn is_authorized(&self, user_id: i64) -> bool {
+        self.authorized_user_ids.contains(&user_id)
     }
 }
 
@@ -465,6 +473,21 @@ where
         .collect()
 }
 
+/// `opt_csv_parsed` + "must not be empty": errors out (citing the key) when
+/// the variable is unset, empty, or contains only separators. Use for
+/// list-shaped fields the bot can't start without (`AUTHORIZED_USER_ID`).
+fn req_csv_parsed<T>(key: &str) -> Result<Vec<T>>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let v = opt_csv_parsed::<T>(key)?;
+    if v.is_empty() {
+        return Err(anyhow!("{key} is required but not set in env"));
+    }
+    Ok(v)
+}
+
 /// Parses a single optional value through `FromStr`. `None` if unset/empty.
 fn opt_parsed<T>(key: &str) -> Result<Option<T>>
 where
@@ -566,6 +589,69 @@ mod tests {
         assert_eq!(parse_stored_bound::<u32>("k", "potato"), None);
         // Valid parses through.
         assert_eq!(parse_stored_bound::<u16>("k", "2015"), Some(2015));
+    }
+
+    #[test]
+    fn req_csv_parsed_accepts_single_and_multiple_ids() {
+        // Single id — the pre-#9 format keeps working unchanged.
+        unsafe {
+            env::set_var("NJUSKA_TEST_REQ_CSV_ONE", "12345");
+        }
+        assert_eq!(
+            req_csv_parsed::<i64>("NJUSKA_TEST_REQ_CSV_ONE").unwrap(),
+            vec![12345]
+        );
+        // Comma-separated list, whitespace-tolerant.
+        unsafe {
+            env::set_var("NJUSKA_TEST_REQ_CSV_MANY", "111, 222 ,333");
+        }
+        assert_eq!(
+            req_csv_parsed::<i64>("NJUSKA_TEST_REQ_CSV_MANY").unwrap(),
+            vec![111, 222, 333]
+        );
+    }
+
+    #[test]
+    fn req_csv_parsed_rejects_missing_empty_and_garbage() {
+        let err = req_csv_parsed::<i64>("NJUSKA_TEST_REQ_CSV_UNSET")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NJUSKA_TEST_REQ_CSV_UNSET"), "{err}");
+
+        // Only separators = effectively empty — still an error, not vec![].
+        unsafe {
+            env::set_var("NJUSKA_TEST_REQ_CSV_SEPARATORS", " , ,");
+        }
+        assert!(req_csv_parsed::<i64>("NJUSKA_TEST_REQ_CSV_SEPARATORS").is_err());
+
+        unsafe {
+            env::set_var("NJUSKA_TEST_REQ_CSV_GARBAGE", "111,potato");
+        }
+        let err = req_csv_parsed::<i64>("NJUSKA_TEST_REQ_CSV_GARBAGE")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("potato"), "{err}");
+    }
+
+    #[test]
+    fn is_authorized_matches_any_listed_id() {
+        let cfg = StaticConfig {
+            database_path: PathBuf::from("/dev/null"),
+            telegram_token: "t".into(),
+            telegram_chat_id: 1,
+            authorized_user_ids: vec![111, 222],
+            save_raw_html: false,
+            zero_results_alert_threshold: 3,
+            fetch_errors_alert_threshold: 3,
+            dumps_dir: PathBuf::from("/tmp"),
+            dump_retention_days: 0,
+            dump_max_total_mb: 0,
+            seen_retention_days: 0,
+            cf_proxy: None,
+        };
+        assert!(cfg.is_authorized(111));
+        assert!(cfg.is_authorized(222));
+        assert!(!cfg.is_authorized(333));
     }
 
     #[test]

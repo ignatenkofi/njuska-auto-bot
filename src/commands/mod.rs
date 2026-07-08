@@ -26,6 +26,7 @@ mod catalog;
 mod handlers;
 mod keyboards;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -157,17 +158,15 @@ pub struct CommandContext {
     /// returns immediately) — perfectly matched to our "change should be
     /// noticed at most once" semantic.
     pub runtime_changed: Arc<Notify>,
-    /// In-flight chassis selection during the `/filter → Кузов` flow.
-    /// `None` = picker isn't open. `Some(Vec)` = user is toggling.
-    /// Becomes `None` again on Save (after persisting) or on Back/menu.
-    ///
-    /// One slot, not a HashMap-per-user — we have exactly one authorised user
-    /// (`AUTHORIZED_USER_ID`). If we ever go multi-user, swap to a
-    /// `HashMap<UserId, Vec<u32>>` keyed on the sender's id.
-    pub chassis_draft: Arc<Mutex<Option<Vec<u32>>>>,
-    /// In-flight model selection. Same shape as `chassis_draft` but with
+    /// In-flight chassis selections during the `/filter → Кузов` flow,
+    /// keyed by the sender's user id (#9): with several authorized users,
+    /// two people toggling at once must not corrupt each other's picks.
+    /// Absent key = picker isn't open for that user; present = toggling.
+    /// The entry is removed on Save (after persisting) or on Back/menu.
+    pub chassis_draft: Arc<Mutex<HashMap<i64, Vec<u32>>>>,
+    /// In-flight model selections. Same shape as `chassis_draft` but with
     /// `String` slugs (since model slugs are textual).
-    pub models_draft: Arc<Mutex<Option<Vec<String>>>>,
+    pub models_draft: Arc<Mutex<HashMap<i64, Vec<String>>>>,
     /// Timestamp of the most recent `/clear` that's still awaiting confirmation.
     /// `None` means no pending request. `Some(t)` is valid for
     /// `CLEAR_CONFIRM_WINDOW` after `t`; afterwards the next `/clear_confirm`
@@ -256,12 +255,12 @@ async fn handle_command(
     cmd: Command,
     ctx: CommandContext,
 ) -> ResponseResult<()> {
-    // Authorisation: ignore commands from anyone but the configured user.
+    // Authorisation: ignore commands from anyone not on the configured list.
     // We compare against the *sender's* user id, not chat id — chat id may be
     // a channel/group (impersonal), but the human pressing the command always
     // has a stable personal user id.
     let user_id: Option<i64> = msg.from.as_ref().map(|u| u.id.0 as i64);
-    let authorized = user_id == Some(ctx.static_cfg.authorized_user_id);
+    let authorized = user_id.is_some_and(|id| ctx.static_cfg.is_authorized(id));
     if !authorized {
         warn!(
             ?user_id,
@@ -319,7 +318,7 @@ async fn handle_unparsed_command(
     ctx: CommandContext,
 ) -> ResponseResult<()> {
     let user_id: Option<i64> = msg.from.as_ref().map(|u| u.id.0 as i64);
-    let authorized = user_id == Some(ctx.static_cfg.authorized_user_id);
+    let authorized = user_id.is_some_and(|id| ctx.static_cfg.is_authorized(id));
     let Some(text) = msg.text() else {
         return Ok(());
     };
@@ -349,14 +348,36 @@ fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().expect("mutex poisoned")
 }
 
-/// Discards all in-flight picker drafts. "Leaving a picker without saving
-/// must not commit toggles" is the wizard's core invariant (#6) — every
-/// navigation away from a multi-select picker (menu, done, back-to-brands)
-/// funnels through this one helper so a new back target can't quietly skip
-/// the cleanup.
-fn discard_drafts(ctx: &CommandContext) {
-    *lock_unpoisoned(&ctx.chassis_draft) = None;
-    *lock_unpoisoned(&ctx.models_draft) = None;
+/// Discards `user_id`'s in-flight picker drafts. "Leaving a picker without
+/// saving must not commit toggles" is the wizard's core invariant (#6) —
+/// every navigation away from a multi-select picker (menu, done,
+/// back-to-brands) funnels through this one helper so a new back target
+/// can't quietly skip the cleanup.
+///
+/// Per-user (#9): user A backing out of their picker must not wipe user B's
+/// half-built selection.
+fn discard_drafts(ctx: &CommandContext, user_id: i64) {
+    lock_unpoisoned(&ctx.chassis_draft).remove(&user_id);
+    lock_unpoisoned(&ctx.models_draft).remove(&user_id);
+}
+
+/// Flips `item` in `user_id`'s draft (creating an empty draft on first use)
+/// and returns a snapshot for the keyboard redraw. Generic because chassis
+/// drafts hold `u32` codes and model drafts hold `String` slugs — the toggle
+/// logic is identical.
+fn toggle_in_draft<T: PartialEq + Clone>(
+    drafts: &Mutex<HashMap<i64, Vec<T>>>,
+    user_id: i64,
+    item: T,
+) -> Vec<T> {
+    let mut map = lock_unpoisoned(drafts);
+    let v = map.entry(user_id).or_default();
+    if let Some(pos) = v.iter().position(|x| *x == item) {
+        v.remove(pos);
+    } else {
+        v.push(item);
+    }
+    v.clone()
 }
 
 /// Single endpoint for every inline-keyboard tap. We dispatch on the
@@ -371,7 +392,7 @@ fn discard_drafts(ctx: &CommandContext) {
 async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> ResponseResult<()> {
     // Authorization — same posture as commands: ignore foreign clicks.
     let user_id = q.from.id.0 as i64;
-    if user_id != ctx.static_cfg.authorized_user_id {
+    if !ctx.static_cfg.is_authorized(user_id) {
         warn!(user_id, "unauthorized callback; ignoring");
         // Still answer the callback so the user's spinner doesn't hang.
         bot.answer_callback_query(q.id.clone()).await?;
@@ -401,7 +422,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
         CB_FILTER_MENU => {
             // Returning to the menu always discards any in-flight picker
             // edits — "back without saving" semantics.
-            discard_drafts(&ctx);
+            discard_drafts(&ctx, user_id);
 
             let (search, interval_secs) = {
                 let r = ctx.runtime.read().await;
@@ -416,7 +437,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Reachable both from the menu and via "back" from the models
             // picker (#6) — the latter leaves an unsaved models draft
             // behind, so this navigation discards too.
-            discard_drafts(&ctx);
+            discard_drafts(&ctx, user_id);
             ("Выбери марку:".to_string(), Some(brand_picker_keyboard()))
         }
         CB_FILTER_BRAND_CUSTOM_HINT => (
@@ -442,20 +463,20 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             )
         }
         CB_FILTER_CHASSIS_PICKER => {
-            // Initialise draft = current runtime.chassis so the picker opens
-            // with existing selections checked.
+            // Initialise this user's draft = current runtime.chassis so the
+            // picker opens with existing selections checked.
             let initial = ctx.runtime.read().await.search.chassis.clone();
-            *lock_unpoisoned(&ctx.chassis_draft) = Some(initial.clone());
+            lock_unpoisoned(&ctx.chassis_draft).insert(user_id, initial.clone());
             (
                 "Выбери типы кузова (можно несколько):".to_string(),
                 Some(chassis_picker_keyboard(&initial)),
             )
         }
         CB_FILTER_CHASSIS_SAVE => {
-            // Commit the draft to runtime + DB. The draft becomes the new
-            // selection, even if empty (= "no chassis filter").
+            // Commit this user's draft to runtime + DB. The draft becomes the
+            // new selection, even if empty (= "no chassis filter").
             let draft = lock_unpoisoned(&ctx.chassis_draft)
-                .take()
+                .remove(&user_id)
                 .unwrap_or_default();
             apply_chassis(&ctx, draft).await;
             let (search, interval_secs) = {
@@ -471,7 +492,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Same "leave dialog" cleanup as CB_FILTER_MENU: discard any
             // hanging drafts. Without this, an abandoned picker edit would
             // sit in memory until the bot restarted.
-            discard_drafts(&ctx);
+            discard_drafts(&ctx, user_id);
 
             let search = ctx.runtime.read().await.search.clone();
             // Final state: text only, no keyboard. `markup = None` clears it.
@@ -628,7 +649,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 ),
                 Some(brand_slug) => match models_for_brand(&brand_slug) {
                     Some(model_list) => {
-                        *lock_unpoisoned(&ctx.models_draft) = Some(initial_models.clone());
+                        lock_unpoisoned(&ctx.models_draft).insert(user_id, initial_models.clone());
                         (
                             models_picker_title(&brand_slug),
                             Some(model_picker_keyboard(model_list, &initial_models)),
@@ -648,7 +669,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
         }
         CB_FILTER_MODELS_SAVE => {
             let draft = lock_unpoisoned(&ctx.models_draft)
-                .take()
+                .remove(&user_id)
                 .unwrap_or_default();
             apply_models(&ctx, draft).await;
             let (search, interval_secs) = {
@@ -675,16 +696,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             let Some(model_list) = models_for_brand(&brand_slug) else {
                 return Ok(());
             };
-            let new_state = {
-                let mut draft = lock_unpoisoned(&ctx.models_draft);
-                let v = draft.get_or_insert_with(Vec::new);
-                if let Some(pos) = v.iter().position(|s| s == slug) {
-                    v.remove(pos);
-                } else {
-                    v.push(slug.to_owned());
-                }
-                v.clone()
-            };
+            let new_state = toggle_in_draft(&ctx.models_draft, user_id, slug.to_owned());
             (
                 models_picker_title(&brand_slug),
                 Some(model_picker_keyboard(model_list, &new_state)),
@@ -697,16 +709,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             };
             // Toggle inside the lock, then take a snapshot for redraw —
             // never hold the Mutex past the lock scope.
-            let new_state = {
-                let mut draft = lock_unpoisoned(&ctx.chassis_draft);
-                let v = draft.get_or_insert_with(Vec::new);
-                if let Some(pos) = v.iter().position(|&x| x == code) {
-                    v.remove(pos);
-                } else {
-                    v.push(code);
-                }
-                v.clone()
-            };
+            let new_state = toggle_in_draft(&ctx.chassis_draft, user_id, code);
             (
                 "Выбери типы кузова (можно несколько):".to_string(),
                 Some(chassis_picker_keyboard(&new_state)),
@@ -757,6 +760,36 @@ mod tests {
                 cmd.command
             );
         }
+    }
+
+    #[test]
+    fn draft_toggle_is_isolated_per_user() {
+        // #9: two authorized users editing pickers concurrently must not
+        // corrupt each other's selections.
+        let drafts: Mutex<HashMap<i64, Vec<u32>>> = Mutex::new(HashMap::new());
+
+        assert_eq!(toggle_in_draft(&drafts, 111, 2634), vec![2634]);
+        // User 222 starts from their own empty draft, not user 111's.
+        assert_eq!(toggle_in_draft(&drafts, 222, 2627), vec![2627]);
+        // User 111's draft is untouched by 222's toggle.
+        assert_eq!(toggle_in_draft(&drafts, 111, 2632), vec![2634, 2632]);
+        // Toggling an already-present item removes it (per user).
+        assert_eq!(toggle_in_draft(&drafts, 111, 2634), vec![2632]);
+        assert_eq!(toggle_in_draft(&drafts, 222, 2627), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn draft_toggle_works_for_string_slugs_too() {
+        // Model drafts use String items through the same generic helper.
+        let drafts: Mutex<HashMap<i64, Vec<String>>> = Mutex::new(HashMap::new());
+        assert_eq!(
+            toggle_in_draft(&drafts, 111, "cooper".to_string()),
+            vec!["cooper".to_string()]
+        );
+        assert_eq!(
+            toggle_in_draft(&drafts, 111, "cooper".to_string()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

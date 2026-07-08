@@ -83,7 +83,7 @@ fn test_static_cfg(dir: &std::path::Path) -> StaticConfig {
         database_path: dir.join("test.db"),
         telegram_token: "000:test-token-never-used".into(),
         telegram_chat_id: 1,
-        authorized_user_id: 1,
+        authorized_user_ids: vec![1],
         save_raw_html: false,
         zero_results_alert_threshold: 3,
         fetch_errors_alert_threshold: 3,
