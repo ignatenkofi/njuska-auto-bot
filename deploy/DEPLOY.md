@@ -234,6 +234,39 @@ Restoring an older DB means the bot forgets listings first seen *after*
 that snapshot — expect a one-time burst of re-notifications for anything
 still live on the site.
 
+## Rotating the CF Worker secret
+
+Rotate `CF_PROXY_SECRET` whenever it may have leaked (pasted in a chat,
+committed by accident, left in a terminal scrollback) — or just
+periodically; it's a two-minute operation.
+
+**On your laptop** (where `wrangler` is set up), from the repo:
+
+```bash
+cd cf-proxy
+./rotate-secret.sh
+```
+
+The script generates a fresh secret (`openssl rand -hex 32`), pushes it to
+the Worker via `wrangler secret put PROXY_SECRET`, and prints the new value
+with follow-up steps. **From that moment the Worker rejects the old secret**,
+so finish the rotation on the VM promptly:
+
+```bash
+sudo -u njuska nano /opt/njuska-auto-bot/.env    # set CF_PROXY_SECRET=<new value>
+sudo systemctl restart njuska-auto-bot
+sudo journalctl -u njuska-auto-bot -n 20 --no-pager
+```
+
+The log must show `CF Worker proxy probe OK`. If you mistype the secret,
+the bot refuses to start with an explicit `CF_PROXY_SECRET` hint (startup
+health-check) — fix `.env` and restart. The few polls missed between the
+two steps are harmless; the poll loop just resumes.
+
+To use a secret from your own password manager instead of a generated one:
+`./rotate-secret.sh '<your-secret>'` (alphanumeric secrets avoid any
+escaping questions).
+
 ## Troubleshooting
 
 **Service won't start** — `journalctl -u njuska-auto-bot -n 30 --no-pager`
