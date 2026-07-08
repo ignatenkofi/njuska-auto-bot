@@ -806,34 +806,31 @@ async fn handle_dump(ctx: &CommandContext, n: u32) -> String {
     if listings.is_empty() {
         return "📋 База пустая — пока ничего не было сохранено.".into();
     }
+    format_dump_message(&listings, n)
+}
 
-    // Compact one-line-per-listing format — different from
-    // `telegram::format_listing_html` which is the per-card layout used for
-    // notifications. Here we want density.
-    let lines: Vec<String> = listings
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            let price = l.price_text.as_deref().unwrap_or("—");
-            let year = l.year.map(|y| y.to_string()).unwrap_or_else(|| "—".into());
-            let city = l.city.as_deref().unwrap_or("?");
-            format!(
-                "{n}. <a href=\"{url}\">{title}</a> — {price} · {year} · {city}",
-                n = i + 1,
-                url = escape_html_attr_for_dump(&l.url),
-                title = escape_html_text_for_dump(&l.title),
-                price = escape_html_text_for_dump(price),
-                year = year,
-                city = escape_html_text_for_dump(city),
-            )
-        })
-        .collect();
+/// Pure formatter behind `/dump` — separated from the handler so the
+/// budget/escaping behavior is unit-testable with adversarial data (#26).
+///
+/// Compact one-line-per-listing format (different from
+/// `telegram::format_listing_html`, the per-card notification layout).
+/// Two defenses against Telegram's 4096-char sendMessage limit:
+/// titles are hard-truncated, and lines stop (with a "… ещё N" note) once
+/// the running total approaches the limit — 25 normal listings fit, 25
+/// pathological ones degrade gracefully instead of triggering a 400.
+fn format_dump_message(listings: &[crate::models::Listing], requested: u32) -> String {
+    /// Telegram's hard cap on message length, in characters.
+    const TG_MESSAGE_LIMIT: usize = 4096;
+    /// Slack reserved for the "… ещё N" tail note.
+    const TAIL_RESERVE: usize = 64;
+    /// Titles longer than this (pre-escaping) get an ellipsis.
+    const MAX_TITLE_CHARS: usize = 120;
 
-    let header = if listings.len() < n as usize {
+    let header = if listings.len() < requested as usize {
         format!(
             "📋 Все <b>{}</b> объявлений в БД (запрошено {}):",
             listings.len(),
-            n
+            requested
         )
     } else {
         format!(
@@ -841,7 +838,40 @@ async fn handle_dump(ctx: &CommandContext, n: u32) -> String {
             listings.len()
         )
     };
-    format!("{header}\n\n{}", lines.join("\n"))
+
+    let mut out = header;
+    out.push('\n');
+    let mut used = out.chars().count();
+    for (i, l) in listings.iter().enumerate() {
+        let price = l.price_text.as_deref().unwrap_or("—");
+        let year = l.year.map(|y| y.to_string()).unwrap_or_else(|| "—".into());
+        let city = l.city.as_deref().unwrap_or("?");
+        let mut title: String = l.title.chars().take(MAX_TITLE_CHARS).collect();
+        if title.chars().count() < l.title.chars().count() {
+            title.push('…');
+        }
+        let line = format!(
+            "{n}. <a href=\"{url}\">{title}</a> — {price} · {year} · {city}",
+            n = i + 1,
+            url = escape_html_attr_for_dump(&l.url),
+            title = escape_html_text_for_dump(&title),
+            price = escape_html_text_for_dump(price),
+            year = year,
+            city = escape_html_text_for_dump(city),
+        );
+        let line_len = line.chars().count() + 1; // +1 for the newline
+        if used + line_len > TG_MESSAGE_LIMIT - TAIL_RESERVE {
+            out.push_str(&format!(
+                "\n… и ещё {} — не влезло в одно сообщение.",
+                listings.len() - i
+            ));
+            break;
+        }
+        out.push('\n');
+        out.push_str(&line);
+        used += line_len;
+    }
+    out
 }
 
 /// `/diag` — one-shot end-to-end fetch diagnostic (#2). Runs the exact same
@@ -1336,15 +1366,16 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                     Some(model_list) => {
                         *lock_unpoisoned(&ctx.models_draft) = Some(initial_models.clone());
                         (
-                            format!("Модели для <b>{brand_slug}</b> (можно несколько):"),
+                            models_picker_title(&brand_slug),
                             Some(model_picker_keyboard(model_list, &initial_models)),
                         )
                     }
                     None => (
                         format!(
-                            "🤷 Для марки <code>{brand_slug}</code> у меня нет каталога моделей.\n\n\
+                            "🤷 Для марки <code>{}</code> у меня нет каталога моделей.\n\n\
                              Поставь модели через <code>SEARCH_MODEL</code> в <code>.env</code>, \
-                             либо смени марку через ✏️ Марка."
+                             либо смени марку через ✏️ Марка.",
+                            crate::telegram::escape_html(&brand_slug)
                         ),
                         Some(filter_menu_keyboard()),
                     ),
@@ -1391,7 +1422,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 v.clone()
             };
             (
-                format!("Модели для <b>{brand_slug}</b> (можно несколько):"),
+                models_picker_title(&brand_slug),
                 Some(model_picker_keyboard(model_list, &new_state)),
             )
         }
@@ -1766,6 +1797,17 @@ fn range_picker_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
+/// Title line of the model picker. Brand slugs from our catalog and the
+/// validated `/setbrand` path are tame, but `SEARCH_BRAND` in `.env` is
+/// free-form — escape rather than trust, or a slug like `a<b` would 400
+/// every picker render (#26).
+fn models_picker_title(brand_slug: &str) -> String {
+    format!(
+        "Модели для <b>{}</b> (можно несколько):",
+        crate::telegram::escape_html(brand_slug)
+    )
+}
+
 /// Model picker keyboard for a specific brand. Same multi-select shape as
 /// chassis (✓/⬜ prefixes, toggle callbacks, Save/Back row).
 ///
@@ -1909,5 +1951,95 @@ mod tests {
                 "bare & at {i} in {escaped}"
             );
         }
+    }
+
+    #[test]
+    fn models_picker_title_escapes_hostile_brand_slug() {
+        // SEARCH_BRAND in .env is free-form; a hostile/typo'd slug must not
+        // break the picker's HTML (#26).
+        let title = models_picker_title("a<b>&\"c");
+        assert!(title.contains("a&lt;b&gt;&amp;\"c"), "{title}");
+        assert!(!title.contains("<b>&"), "{title}");
+        // Sane slugs render unchanged.
+        assert!(models_picker_title("mini").contains("<b>mini</b>"));
+    }
+
+    fn dump_listing(id: u64, title: &str, url: &str) -> crate::models::Listing {
+        crate::models::Listing {
+            id,
+            title: title.into(),
+            url: url.into(),
+            price_text: Some("1.000 €".into()),
+            city: Some("Beograd".into()),
+            year: Some(2015),
+            mileage_km: Some(100_000),
+        }
+    }
+
+    #[test]
+    fn dump_message_normal_case_lists_everything_without_truncation() {
+        let listings: Vec<_> = (1..=25)
+            .map(|i| {
+                dump_listing(
+                    i,
+                    &format!("Car {i}"),
+                    &format!("https://example.com/auto-oglasi/{i}/car"),
+                )
+            })
+            .collect();
+        let msg = format_dump_message(&listings, 25);
+        assert!(msg.contains("25. "), "{msg}");
+        assert!(!msg.contains("не влезло"), "{msg}");
+        assert!(msg.chars().count() <= 4096);
+    }
+
+    #[test]
+    fn dump_message_stays_under_telegram_limit_with_monster_titles() {
+        // Adversarial: 25 listings with 500-char titles full of specials.
+        let monster = "α<>&\"🚗".repeat(84); // ~504 chars, multibyte + specials
+        let listings: Vec<_> = (1..=25)
+            .map(|i| {
+                dump_listing(
+                    i,
+                    &monster,
+                    &format!("https://example.com/auto-oglasi/{i}/x?a=1&b=\"2\""),
+                )
+            })
+            .collect();
+        let msg = format_dump_message(&listings, 25);
+        assert!(
+            msg.chars().count() <= 4096,
+            "must fit Telegram's limit, got {} chars",
+            msg.chars().count()
+        );
+        // Degrades gracefully: tail note instead of a 400 from Telegram.
+        assert!(msg.contains("не влезло"), "{msg}");
+        // Raw specials must never survive into element content.
+        assert!(!msg.contains("<>&"), "{msg}");
+        // Quotes in URLs must be entity-escaped inside href.
+        assert!(msg.contains("&quot;2&quot;"), "{msg}");
+    }
+
+    #[test]
+    fn dump_message_truncates_a_single_huge_title_but_keeps_the_line() {
+        let huge = "X".repeat(3000);
+        let listings = vec![dump_listing(1, &huge, "https://example.com/1")];
+        let msg = format_dump_message(&listings, 1);
+        assert!(msg.chars().count() <= 4096);
+        // Title capped with an ellipsis rather than dropping the listing.
+        assert!(msg.contains("X…"), "{msg}");
+        assert!(msg.contains("<a href="), "{msg}");
+    }
+
+    #[test]
+    fn dump_message_passes_rtl_and_zero_width_through_untouched() {
+        // RTL override and zero-width space are display-level nuisances, not
+        // HTML specials — escaping must not mangle them (Telegram renders
+        // them inert inside a link).
+        let sneaky = "BMW \u{202E}looc\u{200B} car";
+        let listings = vec![dump_listing(1, sneaky, "https://example.com/1")];
+        let msg = format_dump_message(&listings, 1);
+        assert!(msg.contains('\u{202E}'), "{msg}");
+        assert!(msg.contains('\u{200B}'), "{msg}");
     }
 }

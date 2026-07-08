@@ -221,6 +221,48 @@ mod tests {
     }
 
     #[test]
+    fn escape_html_double_escapes_pre_escaped_input() {
+        // Correct behavior: we escape *content*, so text that already looks
+        // like an entity is displayed literally ("&amp;" shows as "&amp;").
+        // Anything smarter would let crafted titles smuggle entities through.
+        assert_eq!(escape_html("&amp;"), "&amp;amp;");
+        assert_eq!(escape_html("&lt;b&gt;"), "&amp;lt;b&amp;gt;");
+    }
+
+    #[test]
+    fn escape_html_passes_rtl_zero_width_and_emoji_through() {
+        // Unicode trickery is not HTML-special; it must survive unchanged
+        // (stripping/mangling would corrupt legitimate Serbian/emoji titles).
+        let s = "🚗 BMW \u{202E}ok\u{200B}done";
+        assert_eq!(escape_html(s), s);
+    }
+
+    #[test]
+    fn format_listing_html_escapes_quotes_and_gt_in_urls() {
+        let mut l = sample_listing();
+        l.url = "https://example.com/a?q=\"x\"&r=<y>".into();
+        let html = format_listing_html(&l);
+        assert!(html.contains("&quot;x&quot;"), "{html}");
+        assert!(html.contains("&lt;y&gt;"), "{html}");
+        assert!(html.contains("&amp;r="), "{html}");
+        // The raw quote must not survive inside the href attribute value.
+        let href_start = html.find("href=\"").unwrap() + 6;
+        let href_end = html[href_start..].find('"').unwrap() + href_start;
+        assert!(!html[href_start..href_end].contains('<'), "{html}");
+    }
+
+    #[test]
+    fn format_listing_html_handles_bare_ampersand_and_long_titles() {
+        let mut l = sample_listing();
+        l.title = format!("Trap & Sons {}", "x".repeat(600));
+        let html = format_listing_html(&l);
+        assert!(html.contains("Trap &amp; Sons"), "{html}");
+        // Notification cards don't truncate — one card is nowhere near the
+        // 4096 limit even with a 600-char title. Pin that assumption.
+        assert!(html.chars().count() < 1200, "{}", html.chars().count());
+    }
+
+    #[test]
     fn classify_maps_io_and_json_errors_to_retryable() {
         use std::sync::Arc;
         use teloxide::RequestError as RE;
