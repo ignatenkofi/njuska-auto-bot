@@ -646,10 +646,16 @@ async fn format_status(ctx: &CommandContext) -> String {
 
     let count = ctx.storage.seen_count().unwrap_or(0);
 
+    // `Url` serialises query params percent-encoded, but `&` between pairs
+    // stays raw — Telegram's HTML parser chokes on a bare `&` inside an
+    // attribute, so it must become `&amp;` (issue #3).
+    let search_url = escape_html_attr_for_dump(search.to_url().as_str());
+
     format!(
         "<b>Текущая конфигурация</b>\n\n\
          {status_icon} Поллинг: <b>{status_text}</b>, интервал <b>{poll_interval_secs}</b> сек\n\n\
-         <b>Фильтры поиска</b>\n{filter}\n\n\
+         <b>Фильтры поиска</b>\n{filter}\n\
+         🔗 <a href=\"{search_url}\">Открыть этот поиск на сайте</a>\n\n\
          <b>База</b>: {count} объявлений в seen_listings\n\
          <b>Версия</b>: <code>{version}</code>",
         status_icon = if paused { "⏸" } else { "▶️" },
@@ -690,7 +696,7 @@ fn format_filter_ru(f: &SearchFilter) -> String {
         } else {
             f.chassis
                 .iter()
-                .map(u32::to_string)
+                .map(|c| chassis_label(*c))
                 .collect::<Vec<_>>()
                 .join(", ")
         }
@@ -710,6 +716,17 @@ fn format_filter_ru(f: &SearchFilter) -> String {
         if f.without_price { "да" } else { "нет" }
     ));
     lines.join("\n")
+}
+
+/// Reverse lookup: chassis code → human label from the [`CHASSIS`] catalog.
+/// Codes set via `SEARCH_CHASSIS` in `.env` may be outside the catalog —
+/// those render as the raw number so nothing is silently hidden (issue #4).
+fn chassis_label(code: u32) -> String {
+    CHASSIS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| code.to_string())
 }
 
 async fn handle_pause(ctx: &CommandContext) -> String {
@@ -1811,4 +1828,50 @@ fn brand_picker_keyboard() -> InlineKeyboardMarkup {
         CB_FILTER_MENU,
     )]);
     InlineKeyboardMarkup::new(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chassis_label_maps_known_codes_and_passes_through_unknown() {
+        assert_eq!(chassis_label(2634), "Кабриолет");
+        assert_eq!(chassis_label(2632), "Внедорожник");
+        // Not in the catalog (e.g. set via SEARCH_CHASSIS in .env) — raw code.
+        assert_eq!(chassis_label(9999), "9999");
+    }
+
+    #[test]
+    fn filter_summary_renders_chassis_as_labels() {
+        let f = SearchFilter {
+            chassis: vec![2634, 9999],
+            ..Default::default()
+        };
+        let s = format_filter_ru(&f);
+        assert!(s.contains("Кабриолет, 9999"), "{s}");
+    }
+
+    #[test]
+    fn status_search_url_is_html_escaped() {
+        // A multi-param filter produces `&` separators in the query string;
+        // inside Telegram HTML they must be escaped to `&amp;`.
+        let f = SearchFilter {
+            brand: Some("mini".into()),
+            models: vec!["cooper".into()],
+            ..Default::default()
+        };
+        let escaped = escape_html_attr_for_dump(f.to_url().as_str());
+        assert!(escaped.contains("&amp;"), "{escaped}");
+        // No bare `&` left: every `&` must start an entity we produced.
+        for (i, _) in escaped.match_indices('&') {
+            assert!(
+                escaped[i..].starts_with("&amp;")
+                    || escaped[i..].starts_with("&lt;")
+                    || escaped[i..].starts_with("&gt;")
+                    || escaped[i..].starts_with("&quot;"),
+                "bare & at {i} in {escaped}"
+            );
+        }
+    }
 }
