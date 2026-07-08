@@ -19,6 +19,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use tracing::warn;
 use url::Url;
 
 use crate::models::{SearchFilter, ShowOldNew};
@@ -212,7 +213,21 @@ impl RuntimeConfig {
                 Vec::new()
             } else {
                 s.split(',')
-                    .filter_map(|p| p.trim().parse::<u32>().ok())
+                    .filter_map(|p| {
+                        let part = p.trim();
+                        // A bad code in the DB (manual edit, older buggy
+                        // version) is dropped, but loudly (#29) — a silently
+                        // vanishing filter is maddening to debug.
+                        let parsed = part.parse::<u32>().ok();
+                        if parsed.is_none() {
+                            warn!(
+                                key = SETTING_SEARCH_CHASSIS,
+                                value = part,
+                                "ignoring unparseable chassis code in runtime_settings"
+                            );
+                        }
+                        parsed
+                    })
                     .collect()
             };
         }
@@ -233,24 +248,17 @@ impl RuntimeConfig {
 
         // For each range bound: empty string → `None` (explicitly cleared);
         // non-empty parseable → `Some(value)`; absent key → leave env value.
-        // The little helper closure keeps the four lookups uniform.
+        // The little helper closure keeps the four lookups uniform. Parse
+        // failures degrade to "no bound" but warn (#29).
         let bound_u32 = |key: &str| -> Result<Option<Option<u32>>> {
-            Ok(storage.get_setting(key)?.map(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    s.parse::<u32>().ok()
-                }
-            }))
+            Ok(storage
+                .get_setting(key)?
+                .map(|s| parse_stored_bound::<u32>(key, &s)))
         };
         let bound_u16 = |key: &str| -> Result<Option<Option<u16>>> {
-            Ok(storage.get_setting(key)?.map(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    s.parse::<u16>().ok()
-                }
-            }))
+            Ok(storage
+                .get_setting(key)?
+                .map(|s| parse_stored_bound::<u16>(key, &s)))
         };
 
         if let Some(v) = bound_u32(SETTING_SEARCH_PRICE_FROM)? {
@@ -267,18 +275,37 @@ impl RuntimeConfig {
         }
 
         let mut poll_interval = load_poll_interval()?;
-        if let Some(s) = storage.get_setting(SETTING_POLL_INTERVAL_SECS)?
-            && let Ok(secs) = s.parse::<u64>()
-            && secs >= MIN_POLL_INTERVAL_SECS
-        {
-            poll_interval = Duration::from_secs(secs);
+        if let Some(s) = storage.get_setting(SETTING_POLL_INTERVAL_SECS)? {
+            match s.parse::<u64>() {
+                Ok(secs) if secs >= MIN_POLL_INTERVAL_SECS => {
+                    poll_interval = Duration::from_secs(secs);
+                }
+                Ok(secs) => warn!(
+                    key = SETTING_POLL_INTERVAL_SECS,
+                    value = secs,
+                    min = MIN_POLL_INTERVAL_SECS,
+                    "stored poll interval below minimum; keeping env/default value"
+                ),
+                Err(_) => warn!(
+                    key = SETTING_POLL_INTERVAL_SECS,
+                    value = %s,
+                    "unparseable poll interval in runtime_settings; keeping env/default value"
+                ),
+            }
         }
 
         // `paused` is pure-runtime: no env knob, defaults to false.
-        let paused = storage
-            .get_setting(SETTING_PAUSED)?
-            .and_then(|s| s.parse::<bool>().ok())
-            .unwrap_or(false);
+        let paused = match storage.get_setting(SETTING_PAUSED)? {
+            Some(s) => s.parse::<bool>().unwrap_or_else(|_| {
+                warn!(
+                    key = SETTING_PAUSED,
+                    value = %s,
+                    "unparseable paused flag in runtime_settings; defaulting to false"
+                );
+                false
+            }),
+            None => false,
+        };
 
         Ok(Self {
             search,
@@ -291,6 +318,28 @@ impl RuntimeConfig {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Parses a stored range bound from `runtime_settings`. Empty string means
+/// "explicitly cleared" → `None`; a non-empty unparseable value also becomes
+/// `None` but logs a `warn!` (#29) so corrupt DB values don't silently drop
+/// a filter the user believes is active.
+fn parse_stored_bound<T>(key: &str, s: &str) -> Option<T>
+where
+    T: FromStr,
+{
+    if s.is_empty() {
+        return None;
+    }
+    let parsed = s.parse::<T>().ok();
+    if parsed.is_none() {
+        warn!(
+            key,
+            value = s,
+            "ignoring unparseable numeric bound in runtime_settings"
+        );
+    }
+    parsed
+}
 
 /// Hard floor: anything below a minute is impolite to the upstream site and
 /// serves no real purpose (listings don't appear that fast). Enforced in
@@ -492,6 +541,16 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    #[test]
+    fn parse_stored_bound_handles_empty_garbage_and_valid() {
+        // Empty = explicitly cleared, no warning path.
+        assert_eq!(parse_stored_bound::<u32>("k", ""), None);
+        // Garbage degrades to None (and warns — not asserted here).
+        assert_eq!(parse_stored_bound::<u32>("k", "potato"), None);
+        // Valid parses through.
+        assert_eq!(parse_stored_bound::<u16>("k", "2015"), Some(2015));
     }
 
     #[test]
