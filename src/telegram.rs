@@ -14,20 +14,50 @@ use crate::models::Listing;
 
 /// Errors that can leak out of [`TelegramClient::send_message`].
 ///
-/// teloxide already classifies failures into a rich enum (`RequestError`)
-/// covering network, JSON, API errors, etc. We carve **one** case off:
-/// `RateLimited`. The poll loop wants to match on 429-with-retry-after
-/// without inspecting variants under `Request(_)` — a top-level variant
-/// makes that one-line.
+/// teloxide already classifies failures into a rich enum (`RequestError`);
+/// we regroup it by **what the caller should do** (#15):
+///
+/// * `RateLimited` — sleep the server-suggested time, then retry.
+/// * `Retryable` — transport-level trouble (connection reset, timeout, a
+///   garbled 502-HTML response). One quick retry is worth it.
+/// * `Permanent` — Telegram understood us and said no (400 bad request,
+///   403 bot blocked, …). Retrying the same payload can't succeed.
 #[derive(Debug, thiserror::Error)]
 pub enum TelegramError {
-    #[error("Telegram request failed: {0}")]
-    Request(teloxide::RequestError),
+    /// Telegram rejected the request. Don't retry — fix the payload/config.
+    #[error("Telegram request failed (permanent): {0}")]
+    Permanent(teloxide::RequestError),
 
-    /// Carved off from `Request` because the caller almost always wants to
-    /// pattern-match this specifically (sleep N seconds then retry).
+    /// Transport-level failure (network, I/O, unparseable response — often a
+    /// 5xx from Telegram's proxies wearing an HTML body). Retry once.
+    #[error("Telegram request failed (retryable): {0}")]
+    Retryable(teloxide::RequestError),
+
+    /// Carved off separately because the caller wants the server-supplied
+    /// wait time (sleep N seconds then retry).
     #[error("Telegram rate limit; retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
+}
+
+/// Maps teloxide's transport-oriented error enum onto our action-oriented
+/// one. Kept as a standalone fn so the policy is unit-testable.
+fn classify(e: teloxide::RequestError) -> TelegramError {
+    use teloxide::RequestError as RE;
+    match e {
+        // `Seconds` is a thin tuple-struct around `u32`; convert to u64 to
+        // match the sleep API in `bot::send_batch`.
+        RE::RetryAfter(after) => TelegramError::RateLimited {
+            retry_after_secs: u64::from(after.seconds()),
+        },
+        // Transport-level failures. InvalidJson counts as retryable because
+        // a 502/504 from Telegram's frontend arrives as an HTML body that
+        // fails JSON parsing — transient by nature.
+        RE::Network(_) | RE::Io(_) | RE::InvalidJson { .. } => TelegramError::Retryable(e),
+        // Api errors (incl. 400s), MigrateToChatId, and anything teloxide
+        // adds later: treat as permanent. Erring towards "don't retry" can
+        // never cause a retry storm.
+        _ => TelegramError::Permanent(e),
+    }
 }
 
 /// Send-only Telegram facade.
@@ -83,13 +113,7 @@ impl TelegramClient {
             .await
         {
             Ok(_) => Ok(()),
-            Err(teloxide::RequestError::RetryAfter(after)) => Err(TelegramError::RateLimited {
-                // `Seconds` is a thin tuple-struct around `u32`. Convert to u64
-                // to match our `RateLimited.retry_after_secs` field and the
-                // sleep API in `bot::send_batch`.
-                retry_after_secs: u64::from(after.seconds()),
-            }),
-            Err(e) => Err(TelegramError::Request(e)),
+            Err(e) => Err(classify(e)),
         }
     }
 }
@@ -171,6 +195,45 @@ mod tests {
     #[test]
     fn escape_html_attr_also_handles_quote() {
         assert_eq!(escape_html_attr("a\"b"), "a&quot;b");
+    }
+
+    #[test]
+    fn classify_maps_io_and_json_errors_to_retryable() {
+        use std::sync::Arc;
+        use teloxide::RequestError as RE;
+
+        let io = RE::Io(Arc::new(std::io::Error::other("conn reset")));
+        assert!(matches!(classify(io), TelegramError::Retryable(_)));
+
+        // A 502 from Telegram's frontend arrives as HTML → JSON parse error.
+        let json_err = serde_json::from_str::<serde_json::Value>("<html>").unwrap_err();
+        let invalid = RE::InvalidJson {
+            source: Arc::new(json_err),
+            raw: "<html>502</html>".into(),
+        };
+        assert!(matches!(classify(invalid), TelegramError::Retryable(_)));
+    }
+
+    #[test]
+    fn classify_maps_api_errors_to_permanent() {
+        use teloxide::ApiError;
+        use teloxide::RequestError as RE;
+
+        // A 400-style error: message text couldn't be parsed as HTML.
+        let bad_request = RE::Api(ApiError::CantParseEntities("bad html".into()));
+        assert!(matches!(classify(bad_request), TelegramError::Permanent(_)));
+    }
+
+    #[test]
+    fn classify_carves_off_rate_limit_with_wait_time() {
+        use teloxide::RequestError as RE;
+        use teloxide::types::Seconds;
+
+        let limited = RE::RetryAfter(Seconds::from_seconds(17));
+        match classify(limited) {
+            TelegramError::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 17),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     fn sample_listing() -> Listing {

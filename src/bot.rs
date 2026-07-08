@@ -336,20 +336,25 @@ pub(crate) fn describe_fetch_error(e: &scraper::ScraperError, via_proxy: bool) -
 /// silently dropped from the returned slice — they'll re-appear in the next
 /// cycle's `unseen` set and we'll retry them then.
 ///
-/// On a 429 we sleep for the server-supplied `retry_after` and retry the
-/// same message **once**. If the retry also fails (429 again or otherwise),
-/// we log and stop the batch — the next cycle (in `poll_interval`) picks
-/// up where we left off, by which point any rate-limit window has expired.
+/// Retry policy per error class (#15):
 ///
-/// Cap on sleep: Telegram has been known to suggest very large `retry_after`
-/// values for "spam-flagged" bots. We clamp to 60s so a misconfigured run
-/// can't freeze the cycle for half an hour.
+/// * **429** — sleep the server-supplied `retry_after` (clamped to 60s;
+///   Telegram has been known to suggest huge values for spam-flagged bots)
+///   and retry **once**. A second failure stops the batch — the next cycle
+///   picks up where we left off, past any rate-limit window.
+/// * **Retryable** (network/5xx/garbled response) — sleep a short fixed
+///   backoff and retry **once**. A second failure also stops the batch:
+///   if the network is down, every remaining send would fail too.
+/// * **Permanent** (400 bad request, …) — logged at `error!` and never
+///   retried; the payload won't get better by resending it.
 async fn send_batch(
     telegram: &TelegramClient,
     listings: &[crate::models::Listing],
 ) -> Vec<crate::models::Listing> {
     /// Hard ceiling on how long we'll sleep waiting out a 429.
     const MAX_BACKOFF_SECS: u64 = 60;
+    /// Fixed pause before retrying a transport-level failure.
+    const RETRYABLE_BACKOFF_SECS: u64 = 3;
 
     let mut sent: Vec<crate::models::Listing> = Vec::with_capacity(listings.len());
 
@@ -385,8 +390,35 @@ async fn send_batch(
                     }
                 }
             }
-            Err(e) => {
-                warn!(id = l.id, error = %e, "telegram send failed");
+            Err(TelegramError::Retryable(e)) => {
+                warn!(
+                    id = l.id,
+                    error = %e,
+                    backoff_secs = RETRYABLE_BACKOFF_SECS,
+                    "transient telegram send failure; retrying once"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(RETRYABLE_BACKOFF_SECS)).await;
+
+                match telegram.send_message(&text).await {
+                    Ok(()) => {
+                        info!(id = l.id, title = %l.title, "sent (after transient-error retry)");
+                        sent.push(l.clone());
+                    }
+                    Err(retry_err) => {
+                        warn!(
+                            id = l.id,
+                            error = %retry_err,
+                            "retry after transient error still failed; stopping batch"
+                        );
+                        break;
+                    }
+                }
+            }
+            Err(e @ TelegramError::Permanent(_)) => {
+                // error!, not warn!: a permanent rejection (usually 400 from
+                // bad HTML in the payload) is a bug in our formatting, not
+                // weather. It will recur every cycle until someone looks.
+                error!(id = l.id, error = %e, "permanent telegram send failure; not retrying");
             }
         }
     }
