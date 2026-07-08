@@ -548,9 +548,11 @@ pub async fn run_command_loop(bot: Bot, ctx: CommandContext) -> Result<()> {
     tokio::select! {
         () = dispatcher.dispatch() => {
             // Dispatcher exited on its own — usually means a network error
-            // tearing down the long-poll. Logged as a warning; main will
-            // notice the task end and shut everything down.
+            // tearing down the long-poll. Returning Err (not Ok) lets main
+            // tell "task died" apart from "clean signal shutdown" and exit
+            // non-zero so systemd's Restart=on-failure kicks in (#14).
             warn!("command dispatcher exited unexpectedly");
+            return Err(anyhow::anyhow!("command dispatcher exited unexpectedly"));
         }
         _ = shutdown_signal() => {
             info!("command listener received shutdown signal");
