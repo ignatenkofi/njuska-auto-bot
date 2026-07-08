@@ -4,16 +4,9 @@
 //! spawn two concurrent tasks (poll loop and command listener), wait for
 //! either to finish. Both ends gracefully on SIGINT/SIGTERM via
 //! [`signals::shutdown_signal`].
-
-mod bot;
-mod commands;
-mod config;
-mod models;
-mod scraper;
-mod signals;
-mod storage;
-mod telegram;
-mod version;
+//!
+//! All modules live in the library crate (`src/lib.rs`) so integration
+//! tests can exercise them; this file only wires them together.
 
 use std::sync::{Arc, Mutex};
 
@@ -21,10 +14,11 @@ use anyhow::{Context, Result};
 use tokio::sync::{Notify, RwLock};
 use tracing::{error, info};
 
-use crate::commands::CommandContext;
-use crate::config::{RuntimeConfig, StaticConfig};
-use crate::storage::Storage;
-use crate::telegram::TelegramClient;
+use njuska_auto_bot::commands::{self, CommandContext};
+use njuska_auto_bot::config::{RuntimeConfig, StaticConfig};
+use njuska_auto_bot::storage::Storage;
+use njuska_auto_bot::telegram::TelegramClient;
+use njuska_auto_bot::{bot, models, scraper, signals, version};
 
 #[tokio::main]
 async fn main() -> Result<()> {

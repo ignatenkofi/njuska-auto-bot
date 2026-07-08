@@ -26,12 +26,12 @@ use crate::config::{RuntimeConfig, StaticConfig};
 use crate::scraper;
 use crate::signals::shutdown_signal;
 use crate::storage::Storage;
-use crate::telegram::{self, TelegramClient, TelegramError};
+use crate::telegram::{self, Notifier, TelegramClient, TelegramError};
 
 /// State that has to survive across cycles. Kept as a separate struct so we
 /// can hand it to a pure `update_streak` helper that's testable in isolation.
 #[derive(Default)]
-pub(crate) struct LoopState {
+pub struct LoopState {
     /// Consecutive cycles where `parse_listings` returned 0.
     zero_streak: u32,
     /// True once we've fired a TG alert for the current streak. Reset when
@@ -91,10 +91,29 @@ pub async fn run(
         "poll loop started; send SIGINT (Ctrl+C) or SIGTERM to stop"
     );
 
+    // Production fetch seam: the real scraper, routed through the proxy when
+    // configured. Takes the filter by value (and clones the proxy config —
+    // a Url + String, pennies) so the returned future owns everything it
+    // touches; borrowing through a generic `Fn` would force higher-ranked
+    // lifetimes on every caller for zero benefit.
+    let cf_proxy = static_cfg.cf_proxy.clone();
+    let fetch = move |filter: crate::models::SearchFilter| {
+        let proxy = cf_proxy.clone();
+        async move { scraper::fetch_search(&filter, proxy.as_ref()).await }
+    };
+
     loop {
         // Run a cycle first — so we poll immediately on bot startup, not
         // after waiting an interval.
-        if let Err(e) = run_one_cycle(&static_cfg, &runtime, &storage, &telegram, &mut state).await
+        if let Err(e) = run_one_cycle(
+            &static_cfg,
+            &runtime,
+            &storage,
+            &telegram,
+            &mut state,
+            &fetch,
+        )
+        .await
         {
             // The cycle's own error path is `warn!` / `error!`; this catches
             // `?` propagations from places we couldn't recover. The loop
@@ -131,13 +150,28 @@ pub async fn run(
 /// it does **not** stop the loop. Most error paths inside this function
 /// instead log at `warn!`/`error!` and continue, so the cycle completes
 /// even when one sub-step fails.
-async fn run_one_cycle(
+///
+/// `pub` with two injected seams (#22) so `tests/poll_cycle.rs` can run the
+/// real cycle — dedup, mark-after-send, streak bookkeeping — against a
+/// fixture and a collector instead of live HTTP:
+///
+/// * `fetch` — anything `SearchFilter -> Future<Result<String, ScraperError>>`.
+///   Production passes a closure over [`scraper::fetch_search`].
+/// * `notifier` — the outbound-send seam ([`Notifier`]); production is the
+///   real [`TelegramClient`].
+pub async fn run_one_cycle<N, F, Fut>(
     static_cfg: &StaticConfig,
     runtime: &Arc<RwLock<RuntimeConfig>>,
     storage: &Storage,
-    telegram: &TelegramClient,
+    notifier: &N,
     state: &mut LoopState,
-) -> Result<()> {
+    fetch: &F,
+) -> Result<()>
+where
+    N: Notifier,
+    F: Fn(crate::models::SearchFilter) -> Fut,
+    Fut: std::future::Future<Output = Result<String, scraper::ScraperError>>,
+{
     // DB maintenance first, *before* the pause check — a bot paused for a
     // month should still honor the retention policy.
     maybe_run_daily_maintenance(static_cfg, storage, state);
@@ -156,7 +190,7 @@ async fn run_one_cycle(
         return Ok(());
     }
 
-    let html = match scraper::fetch_search(&search, static_cfg.cf_proxy.as_ref()).await {
+    let html = match fetch(search).await {
         Ok(h) => {
             // Fetch works again — clear the error streak and re-arm the alert.
             update_fetch_error_streak(state, false, static_cfg.fetch_errors_alert_threshold);
@@ -181,7 +215,7 @@ async fn run_one_cycle(
                     state.fetch_error_streak,
                     telegram::escape_html(&describe_fetch_error(&e, static_cfg.cf_proxy.is_some())),
                 );
-                if let Err(send_err) = telegram.send_message(&alert).await {
+                if let Err(send_err) = notifier.send_html(&alert).await {
                     warn!(error = %send_err, "couldn't send fetch-error alert");
                 } else {
                     state.fetch_error_alerted = true;
@@ -224,7 +258,7 @@ async fn run_one_cycle(
         listings.is_empty(),
         static_cfg.zero_results_alert_threshold,
     ) {
-        if let Err(e) = telegram.send_message(&alert).await {
+        if let Err(e) = notifier.send_html(&alert).await {
             warn!(error = %e, "couldn't send zero-streak alert");
         } else {
             state.streak_alerted = true;
@@ -242,7 +276,7 @@ async fn run_one_cycle(
         "cycle parsed"
     );
 
-    let sent = send_batch(telegram, &unseen).await;
+    let sent = send_batch(notifier, &unseen).await;
     let attempted = unseen.len();
     let sent_count = sent.len();
     storage
@@ -366,8 +400,8 @@ pub(crate) fn describe_fetch_error(e: &scraper::ScraperError, via_proxy: bool) -
 ///   if the network is down, every remaining send would fail too.
 /// * **Permanent** (400 bad request, …) — logged at `error!` and never
 ///   retried; the payload won't get better by resending it.
-async fn send_batch(
-    telegram: &TelegramClient,
+async fn send_batch<N: Notifier>(
+    notifier: &N,
     listings: &[crate::models::Listing],
 ) -> Vec<crate::models::Listing> {
     /// Hard ceiling on how long we'll sleep waiting out a 429.
@@ -379,7 +413,7 @@ async fn send_batch(
 
     for l in listings {
         let text = telegram::format_listing_html(l);
-        match telegram.send_message(&text).await {
+        match notifier.send_html(&text).await {
             Ok(()) => {
                 info!(id = l.id, title = %l.title, "sent");
                 sent.push(l.clone());
@@ -394,7 +428,7 @@ async fn send_batch(
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
 
-                match telegram.send_message(&text).await {
+                match notifier.send_html(&text).await {
                     Ok(()) => {
                         info!(id = l.id, title = %l.title, "sent (after 429 retry)");
                         sent.push(l.clone());
@@ -418,7 +452,7 @@ async fn send_batch(
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(RETRYABLE_BACKOFF_SECS)).await;
 
-                match telegram.send_message(&text).await {
+                match notifier.send_html(&text).await {
                     Ok(()) => {
                         info!(id = l.id, title = %l.title, "sent (after transient-error retry)");
                         sent.push(l.clone());

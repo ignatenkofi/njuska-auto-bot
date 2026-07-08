@@ -60,6 +60,29 @@ fn classify(e: teloxide::RequestError) -> TelegramError {
     }
 }
 
+/// Seam for the poll cycle's outbound messages (#22): production code sends
+/// through [`TelegramClient`]; integration tests plug in a collector and
+/// assert on what *would* have been sent, without any network.
+///
+/// RPITIT (`-> impl Future … + Send`) rather than `async fn` in the trait:
+/// the explicit `Send` bound keeps the poll-loop future spawnable via
+/// `tokio::spawn` without the "async fn in public trait" auto-trait caveat.
+pub trait Notifier {
+    fn send_html(
+        &self,
+        html: &str,
+    ) -> impl std::future::Future<Output = Result<(), TelegramError>> + Send;
+}
+
+impl Notifier for TelegramClient {
+    fn send_html(
+        &self,
+        html: &str,
+    ) -> impl std::future::Future<Output = Result<(), TelegramError>> + Send {
+        self.send_message(html)
+    }
+}
+
 /// Send-only Telegram facade.
 ///
 /// We deliberately do **not** derive `Debug` — printing a `TelegramClient`
