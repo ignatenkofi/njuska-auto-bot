@@ -74,6 +74,12 @@ pub struct StaticConfig {
     pub dumps_dir: PathBuf,
     /// Delete HTML dump folders older than this many days. `0` disables rotation.
     pub dump_retention_days: u32,
+    /// Cap on the *total* size of all HTML dumps, in MiB; oldest files are
+    /// deleted first once it's exceeded (checked after date rotation).
+    /// `0` disables the cap. Complements `dump_retention_days`: retention
+    /// bounds age, this bounds bytes — a short poll interval can produce a
+    /// lot of HTML within the retention window.
+    pub dump_max_total_mb: u64,
     /// Optional Cloudflare Worker proxy. When `Some`, all `polovniautomobili.com`
     /// fetches go through this Worker (which forwards them on CF's own
     /// infrastructure). Bypasses CF's direct-fetch challenge — needed when
@@ -124,6 +130,7 @@ impl std::fmt::Debug for StaticConfig {
             )
             .field("dumps_dir", &self.dumps_dir)
             .field("dump_retention_days", &self.dump_retention_days)
+            .field("dump_max_total_mb", &self.dump_max_total_mb)
             .field("cf_proxy", &self.cf_proxy)
             .finish()
     }
@@ -145,6 +152,7 @@ impl StaticConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./dumps")),
             dump_retention_days: opt_parsed::<u32>("DUMP_RETENTION_DAYS")?.unwrap_or(7),
+            dump_max_total_mb: opt_parsed::<u64>("DUMP_MAX_TOTAL_MB")?.unwrap_or(0),
             cf_proxy: load_cf_proxy()?,
         })
     }

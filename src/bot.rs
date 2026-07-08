@@ -195,6 +195,17 @@ async fn run_one_cycle(
         {
             warn!(error = %e, "couldn't rotate old HTML dumps");
         }
+        // Size cap runs *after* date rotation so it only has to clean up
+        // what retention left behind (#16).
+        if static_cfg.dump_max_total_mb > 0
+            && let Err(e) = enforce_dump_size_cap(
+                &static_cfg.dumps_dir,
+                static_cfg.dump_max_total_mb * 1024 * 1024,
+            )
+            .await
+        {
+            warn!(error = %e, "couldn't enforce dump size cap");
+        }
     }
 
     let listings = scraper::parse_listings(&html);
@@ -477,6 +488,94 @@ async fn rotate_dumps(dumps_dir: &Path, retention_days: u32) -> std::io::Result<
     Ok(())
 }
 
+/// Keeps the total size of all HTML dumps under `max_total_bytes` by deleting
+/// the **oldest files first** (#16). Ordering comes for free from the layout
+/// [`save_html_dump`] writes: day folders sort by date, files inside by
+/// `HHMMSS` name. Day folders emptied by the sweep are removed too.
+///
+/// Files-first (rather than dropping whole day folders) so a single heavy day
+/// can't force deleting *today's* dumps wholesale — we trim from the back
+/// until we fit.
+async fn enforce_dump_size_cap(dumps_dir: &Path, max_total_bytes: u64) -> std::io::Result<()> {
+    // Missing dir = nothing dumped yet = nothing to cap.
+    let mut entries = match tokio::fs::read_dir(dumps_dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    // Day folders, oldest first. Non-date folders are none of our business —
+    // same stance as rotate_dumps.
+    let mut day_dirs: Vec<(NaiveDate, std::path::PathBuf)> = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(d) = NaiveDate::parse_from_str(name_str, "%Y-%m-%d") else {
+            continue;
+        };
+        day_dirs.push((d, entry.path()));
+    }
+    day_dirs.sort();
+
+    // Every dump file with its size, oldest first.
+    let mut files: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    for (_, dir) in &day_dirs {
+        let mut in_dir: Vec<(std::ffi::OsString, std::path::PathBuf, u64)> = Vec::new();
+        let mut rd = tokio::fs::read_dir(dir).await?;
+        while let Some(f) = rd.next_entry().await? {
+            if !f.file_type().await?.is_file() {
+                continue;
+            }
+            let len = f.metadata().await?.len();
+            in_dir.push((f.file_name(), f.path(), len));
+        }
+        // read_dir order is unspecified; HHMMSS names sort chronologically.
+        in_dir.sort();
+        for (_, path, len) in in_dir {
+            total += len;
+            files.push((path, len));
+        }
+    }
+
+    if total <= max_total_bytes {
+        return Ok(());
+    }
+
+    let mut freed: u64 = 0;
+    let mut deleted: u32 = 0;
+    for (path, len) in files {
+        if total - freed <= max_total_bytes {
+            break;
+        }
+        tokio::fs::remove_file(&path).await?;
+        freed += len;
+        deleted += 1;
+    }
+
+    // Sweep away day folders the deletion emptied.
+    for (_, dir) in &day_dirs {
+        let mut rd = tokio::fs::read_dir(dir).await?;
+        if rd.next_entry().await?.is_none() {
+            tokio::fs::remove_dir(dir).await?;
+        }
+    }
+
+    info!(
+        deleted_files = deleted,
+        freed_bytes = freed,
+        total_before = total,
+        cap_bytes = max_total_bytes,
+        "dump size cap enforced"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
@@ -634,6 +733,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("never_existed");
         rotate_dumps(&missing, 7).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn size_cap_deletes_oldest_files_first_and_sweeps_empty_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Three day folders, two 100-byte files each; oldest day first.
+        let mk = |day: &str, file: &str| {
+            let d = root.join(day);
+            std::fs::create_dir_all(&d).unwrap();
+            let p = d.join(file);
+            std::fs::write(&p, [b'x'; 100]).unwrap();
+            p
+        };
+        let old_a = mk("2026-07-01", "080000.html");
+        let old_b = mk("2026-07-01", "090000.html");
+        let mid_a = mk("2026-07-02", "080000.html");
+        let mid_b = mk("2026-07-02", "090000.html");
+        let new_a = mk("2026-07-03", "080000.html");
+        let new_b = mk("2026-07-03", "090000.html");
+        // A non-date folder must be left strictly alone, whatever its size.
+        let other = root.join("notes");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("big.txt"), [b'x'; 10_000]).unwrap();
+
+        // Total dump size = 600; cap at 350 -> the three oldest files
+        // (100 each) must go, freeing down to 300.
+        enforce_dump_size_cap(root, 350).await.unwrap();
+
+        assert!(!old_a.exists(), "oldest file must be deleted first");
+        assert!(!old_b.exists(), "second-oldest must be deleted");
+        assert!(!mid_a.exists(), "third-oldest must be deleted");
+        assert!(mid_b.exists(), "must stop once under the cap");
+        assert!(new_a.exists());
+        assert!(new_b.exists());
+        // The emptied oldest day folder disappears; the half-full one stays.
+        assert!(!root.join("2026-07-01").exists(), "emptied dir swept");
+        assert!(root.join("2026-07-02").exists());
+        assert!(other.exists(), "non-date folder untouched");
+        assert!(other.join("big.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn size_cap_is_a_noop_under_the_limit_and_on_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Missing dir: fine.
+        enforce_dump_size_cap(&root.join("never_existed"), 1)
+            .await
+            .unwrap();
+
+        // Under the cap: nothing deleted.
+        let d = root.join("2026-07-03");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("080000.html");
+        std::fs::write(&f, "small").unwrap();
+        enforce_dump_size_cap(root, 1024).await.unwrap();
+        assert!(f.exists());
     }
 
     #[tokio::test]
