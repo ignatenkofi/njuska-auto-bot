@@ -10,6 +10,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly run so new RustSec advisories against *unchanged* code still
+  # surface — a repo that's quiet for a month shouldn't be silently
+  # vulnerable (#28). Monday 06:20 UTC, after Dependabot's 06:00 sweep.
+  schedule:
+    - cron: "20 6 * * 1"
 
 # Cancel in-flight runs when a new commit lands on the same branch — keeps
 # the queue from filling up with stale jobs while you iterate.
@@ -56,3 +61,18 @@ jobs:
       # release.
       - name: cargo build --release
         run: cargo build --release
+
+  # RustSec advisory scan (#28). Separate job so a vulnerable transitive dep
+  # is a distinct red X from a compile/test failure. The action installs a
+  # prebuilt cargo-audit — much faster than `cargo install cargo-audit`.
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # the action files an issue for advisories on scheduled runs
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
