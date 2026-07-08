@@ -71,6 +71,51 @@ pub enum ScraperError {
     NotUtf8,
 }
 
+impl ScraperError {
+    /// True for failures a quick retry can plausibly fix: network-level curl
+    /// errors, rate limiting, server-side 5xx, and empty bodies. A 403
+    /// (Cloudflare challenge / wrong proxy secret) or a missing curl binary
+    /// won't get better by asking again a second later.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ScraperError::Curl { .. } | ScraperError::EmptyBody => true,
+            ScraperError::Status(s) => *s == 429 || (500..600).contains(s),
+            _ => false,
+        }
+    }
+}
+
+/// [`fetch_search`] wrapped in up-to-`attempts` tries with a short doubling
+/// backoff (1s, 2s, …) on *transient* errors only. Non-transient errors
+/// (403, malformed responses) return immediately — retrying those just
+/// delays the diagnosis.
+///
+/// Used by the startup proxy health-check (#13); `/diag` shares the same
+/// path with `attempts = 1` for a one-shot probe (#2).
+pub async fn fetch_with_retries(
+    filter: &SearchFilter,
+    proxy: Option<&ProxyConfig>,
+    attempts: u32,
+) -> Result<String, ScraperError> {
+    let attempts = attempts.max(1);
+    let mut delay = std::time::Duration::from_secs(1);
+    // The first `attempts - 1` tries may retry; the final one propagates
+    // whatever happens. Backoff stays tiny because callers (startup probe)
+    // want a verdict in seconds — the poll loop has its own long backoff.
+    for attempt in 1..attempts {
+        match fetch_search(filter, proxy).await {
+            Ok(html) => return Ok(html),
+            Err(e) if e.is_transient() => {
+                tracing::warn!(attempt, error = %e, "transient fetch error; retrying after backoff");
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    fetch_search(filter, proxy).await
+}
+
 /// Fetches the search-results page for the given filter and returns the raw HTML.
 ///
 /// **Implementation: shells out to system `curl`.** Why not `reqwest`?
@@ -400,5 +445,25 @@ mod tests {
         assert_eq!(parse_mileage_km("1.234.567 km"), Some(1_234_567));
         assert_eq!(parse_mileage_km("0 km"), Some(0));
         assert_eq!(parse_mileage_km("nepoznato"), None);
+    }
+
+    #[test]
+    fn transient_classification_retries_the_right_errors() {
+        // Retryable: network-level, rate limit, server errors, empty body.
+        assert!(
+            ScraperError::Curl {
+                exit: 28,
+                stderr: "timeout".into()
+            }
+            .is_transient()
+        );
+        assert!(ScraperError::Status(429).is_transient());
+        assert!(ScraperError::Status(502).is_transient());
+        assert!(ScraperError::EmptyBody.is_transient());
+        // Not retryable: CF challenge / auth problems and parse weirdness.
+        assert!(!ScraperError::Status(403).is_transient());
+        assert!(!ScraperError::Status(404).is_transient());
+        assert!(!ScraperError::MalformedStatus("x".into()).is_transient());
+        assert!(!ScraperError::NotUtf8.is_transient());
     }
 }

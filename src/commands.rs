@@ -461,6 +461,8 @@ pub enum Command {
     Dump(u32),
     #[command(description = "Пояснение: команд без режима не нужно отменять.")]
     Cancel,
+    #[command(description = "Разовая проверка фетча: сеть, прокси, парсер.")]
+    Diag,
     #[command(description = "Версия бота (crate + git SHA).")]
     Version,
 }
@@ -616,6 +618,7 @@ async fn handle_command(
         Command::SetBrand(slug) => handle_set_brand(&ctx, slug).await,
         Command::Dump(n) => handle_dump(&ctx, n).await,
         Command::Cancel => format_cancel(),
+        Command::Diag => handle_diag(&ctx).await,
         Command::Version => format!("🤖 NjuskaAutoBot <b>{}</b>", crate::version::VERSION),
     };
 
@@ -838,6 +841,57 @@ async fn handle_dump(ctx: &CommandContext, n: u32) -> String {
         )
     };
     format!("{header}\n\n{}", lines.join("\n"))
+}
+
+/// `/diag` — one-shot end-to-end fetch diagnostic (#2). Runs the exact same
+/// fetch + parse pipeline the poll loop uses (proxy included) and reports
+/// each leg in human terms, so "why is the bot quiet?" is answerable from
+/// the chat without ssh-ing into the box.
+async fn handle_diag(ctx: &CommandContext) -> String {
+    let search = ctx.runtime.read().await.search.clone();
+    let proxy = ctx.static_cfg.cf_proxy.as_ref();
+    let url = search.to_url();
+
+    let mut lines = vec![
+        "🩺 <b>Диагностика фетча</b>".to_string(),
+        format!(
+            "Прокси: <b>{}</b>",
+            if proxy.is_some() {
+                "настроен (CF Worker)"
+            } else {
+                "нет — прямой fetch"
+            }
+        ),
+        format!(
+            "URL: <code>{}</code>",
+            escape_html_text_for_dump(url.as_str())
+        ),
+    ];
+
+    // One-shot (attempts = 1): /diag reports the *current* state; retries
+    // would blur the picture. The startup health-check is the retrying user
+    // of the same helper.
+    match crate::scraper::fetch_with_retries(&search, proxy, 1).await {
+        Ok(html) => {
+            let listings = crate::scraper::parse_listings(&html);
+            lines.push(format!("HTTP: <b>2xx OK</b>, тело {} байт", html.len()));
+            lines.push(format!("Распарсено объявлений: <b>{}</b>", listings.len()));
+            lines.push(if listings.is_empty() {
+                "⚠️ 0 объявлений: либо фильтр слишком узкий, либо селекторы \
+                 устарели (проверь dumps)."
+                    .to_string()
+            } else {
+                "✅ Весь конвейер работает.".to_string()
+            });
+        }
+        Err(e) => {
+            lines.push(format!(
+                "❌ Фетч упал: {}",
+                escape_html_text_for_dump(&crate::bot::describe_fetch_error(&e, proxy.is_some()))
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Minimal HTML-attr escape for `/dump` URLs. We don't pull the helpers from
