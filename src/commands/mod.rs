@@ -349,6 +349,16 @@ fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().expect("mutex poisoned")
 }
 
+/// Discards all in-flight picker drafts. "Leaving a picker without saving
+/// must not commit toggles" is the wizard's core invariant (#6) — every
+/// navigation away from a multi-select picker (menu, done, back-to-brands)
+/// funnels through this one helper so a new back target can't quietly skip
+/// the cleanup.
+fn discard_drafts(ctx: &CommandContext) {
+    *lock_unpoisoned(&ctx.chassis_draft) = None;
+    *lock_unpoisoned(&ctx.models_draft) = None;
+}
+
 /// Single endpoint for every inline-keyboard tap. We dispatch on the
 /// `callback_data` string.
 ///
@@ -390,10 +400,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
     let (text, markup): (String, Option<InlineKeyboardMarkup>) = match data {
         CB_FILTER_MENU => {
             // Returning to the menu always discards any in-flight picker
-            // edits. "Back without saving" semantics belong here, central,
-            // rather than duplicated in every picker's Back path.
-            *lock_unpoisoned(&ctx.chassis_draft) = None;
-            *lock_unpoisoned(&ctx.models_draft) = None;
+            // edits — "back without saving" semantics.
+            discard_drafts(&ctx);
 
             let (search, interval_secs) = {
                 let r = ctx.runtime.read().await;
@@ -404,7 +412,13 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 Some(filter_menu_keyboard()),
             )
         }
-        CB_FILTER_BRAND_PICKER => ("Выбери марку:".to_string(), Some(brand_picker_keyboard())),
+        CB_FILTER_BRAND_PICKER => {
+            // Reachable both from the menu and via "back" from the models
+            // picker (#6) — the latter leaves an unsaved models draft
+            // behind, so this navigation discards too.
+            discard_drafts(&ctx);
+            ("Выбери марку:".to_string(), Some(brand_picker_keyboard()))
+        }
         CB_FILTER_BRAND_CUSTOM_HINT => (
             "💬 <b>Бренд вне каталога?</b>\n\n\
              Отправь команду <code>/setbrand &lt;slug&gt;</code>\n\
@@ -457,8 +471,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // Same "leave dialog" cleanup as CB_FILTER_MENU: discard any
             // hanging drafts. Without this, an abandoned picker edit would
             // sit in memory until the bot restarted.
-            *lock_unpoisoned(&ctx.chassis_draft) = None;
-            *lock_unpoisoned(&ctx.models_draft) = None;
+            discard_drafts(&ctx);
 
             let search = ctx.runtime.read().await.search.clone();
             // Final state: text only, no keyboard. `markup = None` clears it.
@@ -605,11 +618,13 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.brand.clone(), r.search.models.clone())
             };
             match brand {
+                // No brand yet → don't bounce back to the menu; open the
+                // brand picker right here (#6). Picking a brand lands on the
+                // menu, from where models is one tap — and the picker's own
+                // back row keeps the menu reachable.
                 None => (
-                    "❌ Сначала выбери марку — без неё список моделей не известен.\n\n\
-                     Возвращаюсь в меню."
-                        .into(),
-                    Some(filter_menu_keyboard()),
+                    "❌ Сначала выбери марку — без неё список моделей не известен:".into(),
+                    Some(brand_picker_keyboard()),
                 ),
                 Some(brand_slug) => match models_for_brand(&brand_slug) {
                     Some(model_list) => {

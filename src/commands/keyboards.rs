@@ -177,6 +177,12 @@ pub(super) fn range_picker_keyboard(
 /// Model picker keyboard for a specific brand. Same multi-select shape as
 /// chassis (✓/⬜ prefixes, toggle callbacks, Save/Back row).
 ///
+/// Navigation (#6): the models picker is the one screen that logically hangs
+/// *under* another picker — you got here via a brand. So "back" returns to
+/// the brand picker (to fix a wrong brand without bouncing through the
+/// menu), and a separate "menu" button keeps the top level one tap away.
+/// Both leave without saving; the draft is discarded on either path.
+///
 /// `brand_slug` is captured into nothing here — the catalog lookup happens
 /// at the call site; we only need the per-brand model list to render.
 pub(super) fn model_picker_keyboard(
@@ -199,9 +205,13 @@ pub(super) fn model_picker_keyboard(
                 .collect()
         })
         .collect();
+    rows.push(vec![InlineKeyboardButton::callback(
+        "💾 Сохранить",
+        CB_FILTER_MODELS_SAVE,
+    )]);
     rows.push(vec![
-        InlineKeyboardButton::callback("💾 Сохранить", CB_FILTER_MODELS_SAVE),
-        InlineKeyboardButton::callback("↩️ Назад (без сохранения)", CB_FILTER_MENU),
+        InlineKeyboardButton::callback("↩️ К маркам (без сохранения)", CB_FILTER_BRAND_PICKER),
+        InlineKeyboardButton::callback("🏠 В меню", CB_FILTER_MENU),
     ]);
     InlineKeyboardMarkup::new(rows)
 }
@@ -392,6 +402,38 @@ mod tests {
             assert_eq!(checked, slug == "cooper", "{}", btn.text);
         }
         assert_eq!(toggles, models.len());
+    }
+
+    #[test]
+    fn model_picker_back_goes_to_brand_picker_with_menu_still_reachable() {
+        // #6: models hang under a brand, so "back" = brand picker; the menu
+        // must stay one tap away via its own button.
+        let models = super::super::catalog::models_for_brand("mini").unwrap();
+        let kb = model_picker_keyboard(models, &[]);
+        let datas: Vec<&str> = all_buttons(&kb).map(data).collect();
+        assert!(datas.contains(&CB_FILTER_BRAND_PICKER), "{datas:?}");
+        assert!(datas.contains(&CB_FILTER_MENU), "{datas:?}");
+        assert!(datas.contains(&CB_FILTER_MODELS_SAVE), "{datas:?}");
+    }
+
+    #[test]
+    fn menu_spawned_screens_go_back_to_their_spawner_the_menu() {
+        // Every picker opened from the top menu must offer a direct way back
+        // to it (#6) — for the confirmation screen that's the Cancel button.
+        let keyboards = [
+            brand_picker_keyboard(),
+            chassis_picker_keyboard(&[]),
+            interval_picker_keyboard(600),
+            reset_confirm_keyboard(),
+            range_picker_keyboard("price", PRICE_RANGES, (None, None)),
+            range_picker_keyboard("year", YEAR_RANGES, (None, None)),
+        ];
+        for kb in &keyboards {
+            assert!(
+                all_buttons(kb).any(|b| data(b) == CB_FILTER_MENU),
+                "keyboard without a way back to the menu: {kb:?}"
+            );
+        }
     }
 
     #[test]
