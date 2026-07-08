@@ -66,6 +66,10 @@ pub struct StaticConfig {
     pub authorized_user_id: i64,
     pub save_raw_html: bool,
     pub zero_results_alert_threshold: u32,
+    /// Consecutive `fetch_search` failures before alerting to Telegram.
+    /// Parallel to `zero_results_alert_threshold` but for the *fetch* leg
+    /// (network, Cloudflare 403, proxy misconfig) rather than the parser.
+    pub fetch_errors_alert_threshold: u32,
     pub dumps_dir: PathBuf,
     /// Delete HTML dump folders older than this many days. `0` disables rotation.
     pub dump_retention_days: u32,
@@ -113,6 +117,10 @@ impl std::fmt::Debug for StaticConfig {
                 "zero_results_alert_threshold",
                 &self.zero_results_alert_threshold,
             )
+            .field(
+                "fetch_errors_alert_threshold",
+                &self.fetch_errors_alert_threshold,
+            )
             .field("dumps_dir", &self.dumps_dir)
             .field("dump_retention_days", &self.dump_retention_days)
             .field("cf_proxy", &self.cf_proxy)
@@ -129,6 +137,8 @@ impl StaticConfig {
             authorized_user_id: req_parsed::<i64>("AUTHORIZED_USER_ID")?,
             save_raw_html: opt_bool("SAVE_RAW_HTML")?.unwrap_or(true),
             zero_results_alert_threshold: opt_parsed::<u32>("ZERO_RESULTS_ALERT_THRESHOLD")?
+                .unwrap_or(3),
+            fetch_errors_alert_threshold: opt_parsed::<u32>("FETCH_ERRORS_ALERT_THRESHOLD")?
                 .unwrap_or(3),
             dumps_dir: opt_string("DUMPS_DIR")
                 .map(PathBuf::from)

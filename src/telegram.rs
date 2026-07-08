@@ -138,7 +138,10 @@ pub fn format_listing_html(l: &Listing) -> String {
 ///
 /// Order matters: `&` first, otherwise the `&` we just introduced via `&lt;`
 /// would get rewritten on the next pass.
-fn escape_html(s: &str) -> String {
+///
+/// `pub(crate)` so other modules embedding untrusted text into HTML messages
+/// (alerts in `bot.rs`, command replies) reuse this instead of rolling their own.
+pub(crate) fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

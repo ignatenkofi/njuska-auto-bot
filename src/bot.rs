@@ -37,6 +37,13 @@ pub(crate) struct LoopState {
     /// True once we've fired a TG alert for the current streak. Reset when
     /// the streak breaks. Prevents one outage from flooding the chat.
     streak_alerted: bool,
+    /// Consecutive cycles where `fetch_search` itself failed (network, CF
+    /// 403, curl error). Parallel to `zero_streak` but one step earlier in
+    /// the pipeline — a broken *fetch* also deserves an alert (#12), and it
+    /// stretches the effective sleep (see [`effective_sleep`]).
+    fetch_error_streak: u32,
+    /// Same one-alert-per-streak latch as `streak_alerted`.
+    fetch_error_alerted: bool,
 }
 
 /// The main entrypoint. Returns when Ctrl+C / SIGTERM is received (or never,
@@ -93,7 +100,17 @@ pub async fn run(
 
         // Sleep until: the configured interval elapses, OR /interval changes
         // the interval, OR a shutdown signal arrives. Whichever comes first.
-        let sleep_dur = runtime.read().await.poll_interval;
+        // A growing fetch-error streak stretches the sleep (capped at 4x) so
+        // we don't hammer a site or proxy that's actively rejecting us.
+        let base_interval = runtime.read().await.poll_interval;
+        let sleep_dur = effective_sleep(base_interval, state.fetch_error_streak);
+        if sleep_dur > base_interval {
+            warn!(
+                streak = state.fetch_error_streak,
+                sleep_secs = sleep_dur.as_secs(),
+                "stretching sleep due to fetch-error streak"
+            );
+        }
         tokio::select! {
             _ = tokio::time::sleep(sleep_dur) => {}
             _ = runtime_changed.notified() => {
@@ -132,13 +149,36 @@ async fn run_one_cycle(
     }
 
     let html = match scraper::fetch_search(&search, static_cfg.cf_proxy.as_ref()).await {
-        Ok(h) => h,
+        Ok(h) => {
+            // Fetch works again — clear the error streak and re-arm the alert.
+            update_fetch_error_streak(state, false, static_cfg.fetch_errors_alert_threshold);
+            h
+        }
         Err(e) => {
-            // Fetch failures (CF blocked us, network blip, curl bug) are
-            // *transient* by nature — they're not the "parser broken" signal
-            // we want the zero-streak detector to react to. So we don't
-            // touch the streak counter here. Just log and bail this cycle.
-            warn!(error = %e, "fetch failed; will retry next cycle");
+            // Fetch failures are usually transient (network blip) so they're
+            // kept out of the zero-streak/parser detector. But a *persistent*
+            // fetch failure (dead proxy, rotated CF_PROXY_SECRET, CF blocking
+            // us) won't fix itself either — that gets its own streak counter
+            // and a one-off Telegram alert per streak (#12).
+            warn!(
+                error = %e,
+                streak = state.fetch_error_streak + 1,
+                "fetch failed; will retry next cycle"
+            );
+            if update_fetch_error_streak(state, true, static_cfg.fetch_errors_alert_threshold) {
+                let alert = format!(
+                    "⚠️ <b>NjuskaAutoBot alert</b>\n\n\
+                     Fetching the search page failed <b>{}</b> times in a row.\n\
+                     Last error: {}",
+                    state.fetch_error_streak,
+                    telegram::escape_html(&describe_fetch_error(&e, static_cfg.cf_proxy.is_some())),
+                );
+                if let Err(send_err) = telegram.send_message(&alert).await {
+                    warn!(error = %send_err, "couldn't send fetch-error alert");
+                } else {
+                    state.fetch_error_alerted = true;
+                }
+            }
             return Ok(());
         }
     };
@@ -230,6 +270,62 @@ fn update_streak(state: &mut LoopState, listings_empty: bool, threshold: u32) ->
         state.zero_streak = 0;
         state.streak_alerted = false;
         None
+    }
+}
+
+/// Pure state machine for the fetch-error streak, mirroring [`update_streak`].
+/// Returns `true` when the caller should fire the alert *now* (threshold hit
+/// and not yet alerted for this streak). The caller flips
+/// `fetch_error_alerted` after a successful send — same contract as the
+/// zero-streak path.
+fn update_fetch_error_streak(state: &mut LoopState, fetch_failed: bool, threshold: u32) -> bool {
+    if fetch_failed {
+        state.fetch_error_streak += 1;
+        state.fetch_error_streak >= threshold && !state.fetch_error_alerted
+    } else {
+        if state.fetch_error_streak > 0 {
+            info!(
+                previous_streak = state.fetch_error_streak,
+                "fetch recovered; error streak cleared"
+            );
+        }
+        state.fetch_error_streak = 0;
+        state.fetch_error_alerted = false;
+        false
+    }
+}
+
+/// How long to actually sleep given the configured interval and the current
+/// fetch-error streak: 1x, 2x, then capped at 4x. Pure so the doubling/cap
+/// policy is unit-testable without a runtime.
+fn effective_sleep(base: std::time::Duration, error_streak: u32) -> std::time::Duration {
+    let factor = match error_streak {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    };
+    base * factor
+}
+
+/// Human-readable one-liner for a fetch failure, used in the Telegram alert
+/// and by `/diag`. The 403-through-proxy case gets a targeted hint because
+/// it's almost always a rotated/mismatched `CF_PROXY_SECRET`.
+pub(crate) fn describe_fetch_error(e: &scraper::ScraperError, via_proxy: bool) -> String {
+    use crate::scraper::ScraperError;
+    match e {
+        ScraperError::Status(403) if via_proxy => "HTTP 403 through the CF Worker proxy — \
+             check that CF_PROXY_SECRET matches the Worker's PROXY_SECRET \
+             (wrangler secret put PROXY_SECRET)"
+            .to_string(),
+        ScraperError::Status(403) => "HTTP 403 — Cloudflare is challenging direct fetches; \
+             consider the CF Worker proxy (see cf-proxy/README.md)"
+            .to_string(),
+        ScraperError::Status(s) => format!("non-success HTTP status {s}"),
+        ScraperError::Curl { exit, .. } => {
+            format!("curl failed with exit code {exit} (network/DNS/TLS-level error)")
+        }
+        ScraperError::Spawn(io) => format!("couldn't run curl: {io}"),
+        other => other.to_string(),
     }
 }
 
@@ -408,6 +504,61 @@ mod tests {
         // A NEW streak gets a fresh alert.
         let next_alert = update_streak(&mut s, true, 1);
         assert!(next_alert.is_some(), "next streak should re-alert");
+    }
+
+    #[test]
+    fn fetch_error_streak_alerts_once_at_threshold_and_resets_on_success() {
+        let mut s = LoopState::default();
+
+        // Below threshold: no alert.
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+        // At threshold: alert requested.
+        assert!(update_fetch_error_streak(&mut s, true, 3));
+        assert_eq!(s.fetch_error_streak, 3);
+
+        // Simulate the caller's success-side bookkeeping after sending.
+        s.fetch_error_alerted = true;
+        // Same streak: no re-alerts.
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+
+        // Success resets streak and re-arms.
+        assert!(!update_fetch_error_streak(&mut s, false, 3));
+        assert_eq!(s.fetch_error_streak, 0);
+        assert!(!s.fetch_error_alerted);
+
+        // A fresh streak alerts again once it reaches the threshold.
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+        assert!(!update_fetch_error_streak(&mut s, true, 3));
+        assert!(update_fetch_error_streak(&mut s, true, 3));
+    }
+
+    #[test]
+    fn effective_sleep_doubles_then_caps_at_4x() {
+        let base = std::time::Duration::from_secs(600);
+        assert_eq!(effective_sleep(base, 0), base);
+        assert_eq!(effective_sleep(base, 1), base * 2);
+        assert_eq!(effective_sleep(base, 2), base * 4);
+        assert_eq!(effective_sleep(base, 3), base * 4, "capped at 4x");
+        assert_eq!(effective_sleep(base, 100), base * 4, "capped at 4x");
+    }
+
+    #[test]
+    fn describe_fetch_error_hints_at_proxy_secret_on_403_via_proxy() {
+        use crate::scraper::ScraperError;
+
+        let with_proxy = describe_fetch_error(&ScraperError::Status(403), true);
+        assert!(with_proxy.contains("CF_PROXY_SECRET"), "{with_proxy}");
+
+        let without_proxy = describe_fetch_error(&ScraperError::Status(403), false);
+        assert!(
+            !without_proxy.contains("CF_PROXY_SECRET"),
+            "{without_proxy}"
+        );
+        assert!(without_proxy.contains("403"), "{without_proxy}");
+
+        let plain = describe_fetch_error(&ScraperError::Status(500), true);
+        assert!(plain.contains("500"), "{plain}");
     }
 
     #[tokio::test]
