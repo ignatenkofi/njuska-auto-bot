@@ -196,7 +196,10 @@ pub(crate) fn escape_html(s: &str) -> String {
 
 /// Same as [`escape_html`] plus `"` -> `&quot;`. Use inside `href="..."`
 /// attributes; safe (if slightly redundant) anywhere else.
-fn escape_html_attr(s: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`escape_html`] — `/dump` and `/status`
+/// build `href` attributes too and must not roll their own copy (#24).
+pub(crate) fn escape_html_attr(s: &str) -> String {
     escape_html(s).replace('"', "&quot;")
 }
 

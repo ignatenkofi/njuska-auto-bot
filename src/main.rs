@@ -8,6 +8,7 @@
 //! All modules live in the library crate (`src/lib.rs`) so integration
 //! tests can exercise them; this file only wires them together.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -110,12 +111,13 @@ async fn main() -> Result<()> {
     // seconds ago"; if the bot restarts, the pending request is lost (which
     // is correct: a fresh process means a fresh chance to reconsider).
     let pending_clear = Arc::new(Mutex::new(None));
-    // Same shape — in-flight chassis selection during `/filter → Кузов`.
-    // `None` = picker not open. Becomes `None` again on Save or Back.
-    let chassis_draft = Arc::new(Mutex::new(None));
-    // Same shape for models. Decoupled draft slots make it cheap to add more
+    // In-flight chassis selections during `/filter → Кузов`, keyed per user
+    // id (#9) so concurrent authorized users don't clobber each other's
+    // toggles. Absent key = picker not open; entry removed on Save or Back.
+    let chassis_draft = Arc::new(Mutex::new(HashMap::new()));
+    // Same shape for models. Decoupled draft maps make it cheap to add more
     // multi-select pickers later (e.g. fuel types) without state collisions.
-    let models_draft = Arc::new(Mutex::new(None));
+    let models_draft = Arc::new(Mutex::new(HashMap::new()));
 
     // ----- Spawn the poll loop -----
     // The tasks return their `Result` instead of swallowing it: main is the

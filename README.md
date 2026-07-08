@@ -59,8 +59,9 @@ the moment they appear.
 | `/dump N` | Show the last N saved listings as a compact list |
 | `/cancel` | Informational — there's nothing to cancel, this is the answer |
 
-All state-changing commands require the sender's Telegram user-id to match
-`AUTHORIZED_USER_ID` from `.env`. Everyone else's input is logged and dropped.
+All state-changing commands require the sender's Telegram user-id to be in
+`AUTHORIZED_USER_ID` from `.env` (a single id or a comma-separated list).
+Everyone else's input is logged and dropped.
 
 ## Architecture
 
@@ -167,7 +168,8 @@ cp .env.example .env
 # Edit .env — at minimum:
 #   TELEGRAM_BOT_TOKEN (from @BotFather)
 #   TELEGRAM_CHAT_ID   (your user id from @userinfobot, or a channel id)
-#   AUTHORIZED_USER_ID (your user id; only this user can issue commands)
+#   AUTHORIZED_USER_ID (your user id, or a comma-separated list of ids
+#                       allowed to issue commands)
 
 cargo run --release
 ```
@@ -214,8 +216,8 @@ To broadcast to a channel instead of a personal chat:
 3. Find the channel's numeric chat id (starts with `-100`). Easy way: add
    @userinfobot as admin temporarily, it'll print the id.
 4. Set `TELEGRAM_CHAT_ID=-100xxxxxxxxxx` in `.env`.
-5. Leave `AUTHORIZED_USER_ID` as **your** user id (commands still come from
-   a person, not the channel).
+5. Leave `AUTHORIZED_USER_ID` as **your** user id — or a comma-separated
+   list of ids (commands still come from people, not the channel).
 
 ## Configuration
 
