@@ -70,6 +70,7 @@ const INTERVAL_PRESETS: &[(u64, &str)] = &[
     (1800, "30 мин"),
     (3600, "1 час"),
     (7200, "2 часа"),
+    (86_400, "сутки"),
 ];
 
 /// Predefined price ranges, in EUR. `(from, to, display)` — `0` on either
