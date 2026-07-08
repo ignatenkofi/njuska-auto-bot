@@ -44,6 +44,10 @@ pub(crate) struct LoopState {
     fetch_error_streak: u32,
     /// Same one-alert-per-streak latch as `streak_alerted`.
     fetch_error_alerted: bool,
+    /// Day the last DB maintenance (retention prune + VACUUM) ran, so it
+    /// happens once per calendar day regardless of poll cadence (#17).
+    /// `None` on startup — the first cycle always runs maintenance.
+    last_maintenance: Option<NaiveDate>,
 }
 
 /// The main entrypoint. Returns when Ctrl+C / SIGTERM is received (or never,
@@ -134,6 +138,10 @@ async fn run_one_cycle(
     telegram: &TelegramClient,
     state: &mut LoopState,
 ) -> Result<()> {
+    // DB maintenance first, *before* the pause check — a bot paused for a
+    // month should still honor the retention policy.
+    maybe_run_daily_maintenance(static_cfg, storage, state);
+
     // Snapshot what we need under a brief read lock. We deliberately don't
     // hold the lock across any `.await` — the cycle takes ~1s incl. HTTP,
     // and a writer (a `/pause` command) blocked for 1s on every cycle would
@@ -486,6 +494,44 @@ async fn rotate_dumps(dumps_dir: &Path, retention_days: u32) -> std::io::Result<
         }
     }
     Ok(())
+}
+
+/// Once-a-day DB housekeeping (#17): prune `seen_listings` rows older than
+/// the retention window, then `VACUUM` so the file actually shrinks.
+///
+/// Synchronous on purpose — both operations are sub-millisecond at our row
+/// counts (see the module docs in `storage.rs` on sync rusqlite under tokio).
+/// Errors are logged, never propagated: a failed VACUUM must not cost us a
+/// poll cycle. We stamp `last_maintenance` *before* doing the work so a
+/// persistent failure retries tomorrow, not every 10 minutes all day.
+fn maybe_run_daily_maintenance(
+    static_cfg: &StaticConfig,
+    storage: &Storage,
+    state: &mut LoopState,
+) {
+    let today = Local::now().date_naive();
+    if state.last_maintenance == Some(today) {
+        return;
+    }
+    state.last_maintenance = Some(today);
+
+    if static_cfg.seen_retention_days > 0 {
+        match storage.prune_seen_older_than(static_cfg.seen_retention_days) {
+            Ok(0) => debug!("retention prune: nothing to remove"),
+            Ok(n) => info!(
+                pruned = n,
+                retention_days = static_cfg.seen_retention_days,
+                "pruned old seen_listings rows"
+            ),
+            Err(e) => warn!(error = %e, "couldn't prune seen_listings"),
+        }
+    }
+
+    if let Err(e) = storage.vacuum() {
+        warn!(error = %e, "daily VACUUM failed");
+    } else {
+        debug!("daily VACUUM done");
+    }
 }
 
 /// Keeps the total size of all HTML dumps under `max_total_bytes` by deleting

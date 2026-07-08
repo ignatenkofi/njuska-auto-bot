@@ -80,6 +80,10 @@ pub struct StaticConfig {
     /// bounds age, this bounds bytes — a short poll interval can produce a
     /// lot of HTML within the retention window.
     pub dump_max_total_mb: u64,
+    /// Delete `seen_listings` rows older than this many days (dedup memory).
+    /// `0` = keep forever. Default 180 (~6 months). See `.env.example` for
+    /// the re-notification caveat.
+    pub seen_retention_days: u32,
     /// Optional Cloudflare Worker proxy. When `Some`, all `polovniautomobili.com`
     /// fetches go through this Worker (which forwards them on CF's own
     /// infrastructure). Bypasses CF's direct-fetch challenge — needed when
@@ -131,6 +135,7 @@ impl std::fmt::Debug for StaticConfig {
             .field("dumps_dir", &self.dumps_dir)
             .field("dump_retention_days", &self.dump_retention_days)
             .field("dump_max_total_mb", &self.dump_max_total_mb)
+            .field("seen_retention_days", &self.seen_retention_days)
             .field("cf_proxy", &self.cf_proxy)
             .finish()
     }
@@ -153,6 +158,7 @@ impl StaticConfig {
                 .unwrap_or_else(|| PathBuf::from("./dumps")),
             dump_retention_days: opt_parsed::<u32>("DUMP_RETENTION_DAYS")?.unwrap_or(7),
             dump_max_total_mb: opt_parsed::<u64>("DUMP_MAX_TOTAL_MB")?.unwrap_or(0),
+            seen_retention_days: opt_parsed::<u32>("SEEN_RETENTION_DAYS")?.unwrap_or(180),
             cf_proxy: load_cf_proxy()?,
         })
     }
