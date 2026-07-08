@@ -461,6 +461,8 @@ pub enum Command {
     Dump(u32),
     #[command(description = "Пояснение: команд без режима не нужно отменять.")]
     Cancel,
+    #[command(description = "Версия бота (crate + git SHA).")]
+    Version,
 }
 
 /// How long after `/clear` a matching `/clear_confirm` is still accepted.
@@ -612,6 +614,7 @@ async fn handle_command(
         Command::SetBrand(slug) => handle_set_brand(&ctx, slug).await,
         Command::Dump(n) => handle_dump(&ctx, n).await,
         Command::Cancel => format_cancel(),
+        Command::Version => format!("🤖 NjuskaAutoBot <b>{}</b>", crate::version::VERSION),
     };
 
     bot.send_message(msg.chat.id, reply)
@@ -647,7 +650,8 @@ async fn format_status(ctx: &CommandContext) -> String {
         "<b>Текущая конфигурация</b>\n\n\
          {status_icon} Поллинг: <b>{status_text}</b>, интервал <b>{poll_interval_secs}</b> сек\n\n\
          <b>Фильтры поиска</b>\n{filter}\n\n\
-         <b>База</b>: {count} объявлений в seen_listings",
+         <b>База</b>: {count} объявлений в seen_listings\n\
+         <b>Версия</b>: <code>{version}</code>",
         status_icon = if paused { "⏸" } else { "▶️" },
         status_text = if paused {
             "на паузе"
@@ -655,6 +659,7 @@ async fn format_status(ctx: &CommandContext) -> String {
             "работает"
         },
         filter = format_filter_ru(&search),
+        version = crate::version::VERSION,
     )
 }
 

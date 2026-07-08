@@ -13,6 +13,7 @@ mod scraper;
 mod signals;
 mod storage;
 mod telegram;
+mod version;
 
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +28,17 @@ use crate::telegram::TelegramClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `--version` is the cheap startup path: print and exit before touching
+    // .env, tracing, or the database. Deployment scripts and the Debian
+    // smoke test rely on this working with zero configuration present.
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!("njuska_auto_bot {}", version::VERSION);
+        return Ok(());
+    }
+
     // Load .env first so RUST_LOG etc. are visible to tracing_subscriber below.
     // `.ok()` because a missing .env is fine in environments that inject env vars
     // directly (containers, systemd unit, CI).
@@ -34,7 +46,7 @@ async fn main() -> Result<()> {
 
     init_tracing();
 
-    info!("njuska_auto_bot starting");
+    info!(version = version::VERSION, "njuska_auto_bot starting");
 
     // Two-step config load: static first (everything we need to *open* storage,
     // including DB path), then runtime (which depends on storage being open
