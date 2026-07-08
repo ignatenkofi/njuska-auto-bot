@@ -118,6 +118,30 @@ pub enum Command {
 /// confirmed-later scenarios.
 const CLEAR_CONFIRM_WINDOW: Duration = Duration::from_secs(30);
 
+/// Commands surfaced in the Telegram client's `/`-autocomplete menu, in
+/// display order. Deliberately a small subset (#8): a new user opening the
+/// bot should see the daily-driver commands, not a wall of fourteen.
+/// Everything else (`/dump`, `/diag`, `/clear`, …) still works when typed —
+/// `setMyCommands` only controls the menu, not parsing — and stays
+/// discoverable via `/help`.
+const MENU_COMMANDS: &[&str] = &["filter", "status", "pause", "resume", "help"];
+
+/// The curated `setMyCommands` payload: [`MENU_COMMANDS`] resolved against
+/// the derive-generated full list, so descriptions never drift from the
+/// `#[command(description = …)]` attributes. Silently skipping a typo'd
+/// name here would shrink the menu unnoticed — the unit test pins the count.
+fn menu_commands() -> Vec<teloxide::types::BotCommand> {
+    let all = Command::bot_commands();
+    MENU_COMMANDS
+        .iter()
+        .filter_map(|name| {
+            all.iter()
+                .find(|c| c.command.trim_start_matches('/') == *name)
+                .cloned()
+        })
+        .collect()
+}
+
 /// State each command handler needs. Cloned per handler invocation (cheap
 /// — every field is `Arc<…>` or the bot, which has internal `Arc`).
 #[derive(Clone)]
@@ -162,26 +186,35 @@ pub struct CommandContext {
 pub async fn run_command_loop(bot: Bot, ctx: CommandContext) -> Result<()> {
     info!("command listener starting");
 
-    // Set the bot's `/help` menu in the Telegram client. The `setMyCommands`
-    // call is idempotent and best-effort; failure isn't fatal — the bot still
-    // works without the menu, just no auto-complete in the TG client.
-    if let Err(e) = bot.set_my_commands(Command::bot_commands()).await {
+    // Set the bot's `/`-autocomplete menu in the Telegram client. Curated
+    // subset only (#8) — every command still *parses*, the menu is just the
+    // storefront. The `setMyCommands` call is idempotent and best-effort;
+    // failure isn't fatal — the bot still works without the menu, just no
+    // auto-complete in the TG client.
+    if let Err(e) = bot.set_my_commands(menu_commands()).await {
         warn!(error = ?e, "couldn't register /help menu (continuing anyway)");
     }
 
-    // The handler tree has **two branches** in v2 session 3:
+    // The handler tree has **three branches**:
     //   1. Update is a Message AND parses as a `Command` → `handle_command`.
-    //   2. Update is a CallbackQuery (inline-keyboard tap) → `handle_callback`.
+    //   2. Update is a Message that *looks* like a command (starts with `/`)
+    //      but didn't parse — wrong args (`/interval abc`), missing args
+    //      (bare `/dump`), or a typo'd name → `handle_unparsed_command` (#8).
+    //      Without this branch such messages fell through to teloxide's
+    //      "Unhandled update" warning and the user got no reply at all.
+    //   3. Update is a CallbackQuery (inline-keyboard tap) → `handle_callback`.
     //
-    // teloxide tries them in order; the first one that matches wins. Updates
-    // that match neither branch are dropped with an "Unhandled update" warning
-    // (you can see those in the logs as a debug hint when something doesn't
-    // wire up correctly).
+    // teloxide tries them in order; the first one that matches wins.
     let handler = dptree::entry()
         .branch(
             Update::filter_message()
                 .filter_command::<Command>()
                 .endpoint(handle_command),
+        )
+        .branch(
+            Update::filter_message()
+                .filter(|msg: Message| msg.text().is_some_and(|t| t.starts_with('/')))
+                .endpoint(handle_unparsed_command),
         )
         .branch(Update::filter_callback_query().endpoint(handle_callback));
 
@@ -269,6 +302,39 @@ async fn handle_command(
     };
 
     bot.send_message(msg.chat.id, reply)
+        .parse_mode(ParseMode::Html)
+        .await?;
+    Ok(())
+}
+
+/// Endpoint for messages that look like a command but failed `Command::parse`
+/// (#8): wrong or missing arguments, or an unknown name. Replies with a short
+/// usage hint instead of the previous silence.
+///
+/// Same authorization posture as `handle_command` — strangers get the silent
+/// drop, not a hint that the bot is alive.
+async fn handle_unparsed_command(
+    bot: Bot,
+    msg: Message,
+    ctx: CommandContext,
+) -> ResponseResult<()> {
+    let user_id: Option<i64> = msg.from.as_ref().map(|u| u.id.0 as i64);
+    let authorized = user_id == Some(ctx.static_cfg.authorized_user_id);
+    let Some(text) = msg.text() else {
+        return Ok(());
+    };
+    if !authorized {
+        warn!(
+            ?user_id,
+            chat_id = msg.chat.id.0,
+            text,
+            "unauthorized unparseable command; ignoring"
+        );
+        return Ok(());
+    }
+
+    info!(text, ?user_id, "command-shaped message failed to parse");
+    bot.send_message(msg.chat.id, handlers::usage_hint(text))
         .parse_mode(ParseMode::Html)
         .await?;
     Ok(())
@@ -649,4 +715,46 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
         warn!(error = %e, "edit_message_text failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_registers_exactly_the_curated_commands_in_order() {
+        // filter_map in menu_commands would silently drop a typo'd name —
+        // pin the exact list so the menu can't shrink unnoticed.
+        let menu: Vec<String> = menu_commands()
+            .iter()
+            .map(|c| c.command.trim_start_matches('/').to_string())
+            .collect();
+        assert_eq!(menu, MENU_COMMANDS);
+    }
+
+    #[test]
+    fn menu_descriptions_come_from_the_derive() {
+        for cmd in menu_commands() {
+            assert!(
+                !cmd.description.is_empty(),
+                "{} has no description",
+                cmd.command
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_commands_still_parse() {
+        // The whole point of #8: hiding from the menu must not hide from the
+        // parser. /dump is menu-hidden but must keep working when typed.
+        use teloxide::utils::command::BotCommands;
+        let cmd = Command::parse("/dump 10", "TestBot").unwrap();
+        assert!(matches!(cmd, Command::Dump(10)));
+        let cmd = Command::parse("/diag", "TestBot").unwrap();
+        assert!(matches!(cmd, Command::Diag));
+        // And the fallback trigger case really does fail to parse.
+        assert!(Command::parse("/interval abc", "TestBot").is_err());
+        assert!(Command::parse("/dump", "TestBot").is_err());
+    }
 }

@@ -687,6 +687,41 @@ pub(super) fn models_picker_title(brand_slug: &str) -> String {
     )
 }
 
+/// Builds the reply for a command-shaped message that failed `Command::parse`
+/// (#8): `/interval abc`, bare `/dump`, or an unknown `/frobnicate`.
+///
+/// Two cases:
+/// * The base command exists → almost certainly an argument problem; repeat
+///   that command's own description (they embed examples where args exist).
+/// * Unknown command → point at `/help`.
+///
+/// Pure function of the message text so it's unit-testable; the descriptions
+/// come from the same derive that feeds `/help`, so hints never drift.
+pub(super) fn usage_hint(text: &str) -> String {
+    use teloxide::utils::command::BotCommands;
+
+    // First whitespace token is the command; `@BotName` suffixes are how TG
+    // disambiguates commands in group chats — strip before matching.
+    let first = text.split_whitespace().next().unwrap_or(text);
+    let name = first.trim_start_matches('/');
+    let name = name.split('@').next().unwrap_or(name);
+
+    let known = super::Command::bot_commands();
+    match known
+        .iter()
+        .find(|c| c.command.trim_start_matches('/') == name)
+    {
+        Some(c) => format!(
+            "❌ Не понял аргументы для <code>/{name}</code>.\n{}",
+            escape_html(&c.description)
+        ),
+        None => format!(
+            "🤷 Не знаю команду <code>{}</code>. Список команд — /help.",
+            escape_html(first)
+        ),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
@@ -743,6 +778,41 @@ mod tests {
         assert!(!title.contains("<b>&"), "{title}");
         // Sane slugs render unchanged.
         assert!(models_picker_title("mini").contains("<b>mini</b>"));
+    }
+
+    #[test]
+    fn usage_hint_for_known_command_repeats_its_description() {
+        // Bad args on a real command → its own description, which carries
+        // the example.
+        let hint = usage_hint("/interval abc");
+        assert!(hint.contains("<code>/interval</code>"), "{hint}");
+        assert!(hint.contains("/interval 300"), "{hint}");
+        // Bare /dump (missing required arg) is the same case.
+        let hint = usage_hint("/dump");
+        assert!(hint.contains("<code>/dump</code>"), "{hint}");
+        assert!(hint.contains("/dump 10"), "{hint}");
+    }
+
+    #[test]
+    fn usage_hint_strips_bot_mention_before_matching() {
+        // Group-chat form: /interval@SomeBot 5x — still the known-command path.
+        let hint = usage_hint("/interval@NjuskaAutoBot abc");
+        assert!(hint.contains("<code>/interval</code>"), "{hint}");
+    }
+
+    #[test]
+    fn usage_hint_for_unknown_command_points_at_help() {
+        let hint = usage_hint("/frobnicate now");
+        assert!(hint.contains("/help"), "{hint}");
+        assert!(hint.contains("frobnicate"), "{hint}");
+    }
+
+    #[test]
+    fn usage_hint_escapes_hostile_input() {
+        // The echoed command name is user-controlled — must be HTML-safe.
+        let hint = usage_hint("/x<script>&");
+        assert!(hint.contains("&lt;script&gt;"), "{hint}");
+        assert!(!hint.contains("<script>"), "{hint}");
     }
 
     #[test]
