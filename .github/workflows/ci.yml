@@ -76,3 +76,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2026-0173: proc-macro-error2 is unmaintained. Pulled in
+          # transitively via teloxide 0.17 -> aquamarine; nothing on our side
+          # can swap it out. Re-check when bumping teloxide.
+          ignore: RUSTSEC-2026-0173
