@@ -175,15 +175,42 @@ pub async fn fetch_search(
         .arg("-w")
         .arg("%{stderr}%{http_code}"); // status code -> stderr, body -> stdout
 
-    // Authenticate to our Worker. Header value is treated as opaque on the
-    // CLI; no shell-escaping concerns since `secret` from env is alphanumeric.
-    if let Some(p) = proxy {
-        cmd.arg("-H").arg(format!("x-proxy-secret: {}", p.secret));
+    // Authenticate to our Worker. The secret travels as a curl *config file
+    // on stdin* (`--config -`), never on argv — /proc/<pid>/cmdline is
+    // world-readable, so `-H "x-proxy-secret: ..."` would leak it to every
+    // local process for the duration of the request (#21).
+    if proxy.is_some() {
+        cmd.arg("--config").arg("-");
+        cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
     }
 
     cmd.arg(request_url.as_str());
 
-    let output = cmd.output().await?;
+    // spawn + wait_with_output instead of `.output()` because we may need to
+    // write the config to stdin between the two. stdout/stderr must be piped
+    // explicitly — `.output()` did that for us, `.spawn()` doesn't.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    if let Some(p) = proxy {
+        use tokio::io::AsyncWriteExt;
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err(ScraperError::Spawn(std::io::Error::other(
+                "curl stdin was not piped",
+            )));
+        };
+        stdin
+            .write_all(proxy_secret_config(&p.secret).as_bytes())
+            .await?;
+        // Dropping the handle closes the pipe — curl needs the EOF to know
+        // the config is complete before it starts the transfer.
+        drop(stdin);
+    }
+
+    let output = child.wait_with_output().await?;
 
     // curl itself failed (network/TLS error, not HTTP error).
     if !output.status.success() {
@@ -211,6 +238,16 @@ pub async fn fetch_search(
         return Err(ScraperError::EmptyBody);
     }
     Ok(body)
+}
+
+/// Renders the `x-proxy-secret` header as one line of curl config-file
+/// syntax, for feeding via `--config -`. Inside curl's double-quoted config
+/// strings, backslash and the quote itself must be escaped — secrets are
+/// alphanumeric by convention, but a knob that breaks on exotic input is a
+/// footgun.
+fn proxy_secret_config(secret: &str) -> String {
+    let escaped = secret.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("header = \"x-proxy-secret: {escaped}\"\n")
 }
 
 // --- Selectors ---
@@ -445,6 +482,19 @@ mod tests {
         assert_eq!(parse_mileage_km("1.234.567 km"), Some(1_234_567));
         assert_eq!(parse_mileage_km("0 km"), Some(0));
         assert_eq!(parse_mileage_km("nepoznato"), None);
+    }
+
+    #[test]
+    fn proxy_secret_config_produces_curl_config_line_and_escapes_quoting() {
+        assert_eq!(
+            proxy_secret_config("s3cr3t"),
+            "header = \"x-proxy-secret: s3cr3t\"\n"
+        );
+        // Quote and backslash must be escaped per curl config quoting rules.
+        assert_eq!(
+            proxy_secret_config(r#"we"ird\one"#),
+            "header = \"x-proxy-secret: we\\\"ird\\\\one\"\n"
+        );
     }
 
     #[test]
