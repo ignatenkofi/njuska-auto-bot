@@ -173,15 +173,66 @@ sudo /opt/njuska-auto-bot/src/deploy/update.sh
 # sudo systemctl start njuska-auto-bot
 ```
 
-## Backup
+## Backup & restore
 
 Everything stateful lives in `/opt/njuska-auto-bot`:
 - `.env` — config + secrets
 - `njuska.db` — dedup DB + runtime settings
 - `dumps/` — optional, auto-rotated, regenerable
 
-A nightly `tar czf njuska-$(date +%F).tgz /opt/njuska-auto-bot/{.env,njuska.db}`
-covers everything you can't reproduce from git.
+### Automatic daily backups
+
+`deploy/njuska-backup.service` + `.timer` snapshot the DB and `.env` into
+`/opt/njuska-auto-bot/backups/` every night at 04:30 and keep the newest
+**14 copies** of each. The DB snapshot goes through `sqlite3 .backup` —
+SQLite's own backup API — so it's **consistent even while the bot is
+running mid-transaction**; a plain `cp` of a live DB can capture a torn
+page.
+
+Install:
+
+```bash
+sudo apt install -y sqlite3
+sudo install -m 0644 \
+    /opt/njuska-auto-bot/src/deploy/njuska-backup.service \
+    /opt/njuska-auto-bot/src/deploy/njuska-backup.timer \
+    /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now njuska-backup.timer
+
+# Verify: next scheduled run + take one backup right now
+systemctl list-timers njuska-backup.timer
+sudo systemctl start njuska-backup.service
+ls -la /opt/njuska-auto-bot/backups/
+```
+
+Backups are local to the VM. For real disaster tolerance, also pull them
+off-box occasionally (Proxmox VM snapshots, or an rsync of `backups/` to
+your workstation).
+
+### Restore
+
+```bash
+# 1. Stop the bot so nothing writes to the DB mid-restore.
+sudo systemctl stop njuska-auto-bot
+
+# 2. Put the chosen snapshot back (pick the date you want).
+sudo -u njuska cp /opt/njuska-auto-bot/backups/njuska-2026-07-01.db \
+                  /opt/njuska-auto-bot/njuska.db
+
+# 3. If .env was lost too:
+sudo -u njuska cp /opt/njuska-auto-bot/backups/env-2026-07-01 \
+                  /opt/njuska-auto-bot/.env
+sudo chmod 600 /opt/njuska-auto-bot/.env
+
+# 4. Start and check.
+sudo systemctl start njuska-auto-bot
+sudo journalctl -u njuska-auto-bot -n 20 --no-pager
+```
+
+Restoring an older DB means the bot forgets listings first seen *after*
+that snapshot — expect a one-time burst of re-notifications for anything
+still live on the site.
 
 ## Troubleshooting
 

@@ -1,0 +1,47 @@
+# Daily backup of NjuskaAutoBot's stateful files (#19).
+#
+# Snapshots njuska.db via `sqlite3 .backup` — a *consistent* copy taken
+# through SQLite's own backup API even while the bot is mid-transaction —
+# plus .env, into /opt/njuska-auto-bot/backups/. Keeps 14 daily copies.
+#
+# Install (with the .timer next to this file):
+#   sudo apt install -y sqlite3
+#   sudo install -m 0644 njuska-backup.service njuska-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now njuska-backup.timer
+#
+# Check:
+#   systemctl list-timers njuska-backup.timer
+#   sudo systemctl start njuska-backup.service   # run one backup right now
+#
+# Restore procedure: see deploy/DEPLOY.md, "Backup & restore".
+
+[Unit]
+Description=NjuskaAutoBot daily backup (SQLite snapshot + .env)
+Documentation=https://github.com/ignatenkofi/njuska-auto-bot
+# Backing up a missing DB is a no-op, not an error, so no hard dependency
+# on the bot service — backups keep working while the bot is stopped.
+
+[Service]
+Type=oneshot
+User=njuska
+Group=njuska
+WorkingDirectory=/opt/njuska-auto-bot
+
+# Three steps, each its own ExecStart (oneshot runs them in order):
+#   1. ensure the backups dir exists
+#   2. consistent DB snapshot via SQLite's backup API (NOT `cp` — copying
+#      the file mid-write can capture a torn page; .backup never does)
+#      + copy .env alongside it (tokens are part of "restorable state")
+#   3. rotation: keep the newest 14 of each, delete the rest
+ExecStart=/usr/bin/mkdir -p /opt/njuska-auto-bot/backups
+ExecStart=/bin/sh -c 'test -f njuska.db && sqlite3 njuska.db ".backup backups/njuska-$$(date +%%F).db" || echo "no njuska.db yet; skipping DB snapshot"'
+ExecStart=/bin/sh -c 'cp -p .env "backups/env-$$(date +%%F)" 2>/dev/null || true'
+ExecStart=/bin/sh -c 'ls -1t backups/njuska-*.db 2>/dev/null | tail -n +15 | xargs -r rm --; ls -1t backups/env-* 2>/dev/null | tail -n +15 | xargs -r rm --'
+
+# Same hardening posture as the bot unit, scoped to the state dir.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/njuska-auto-bot
+ProtectHome=true
