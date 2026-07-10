@@ -39,6 +39,9 @@ pub const SETTING_SEARCH_BRAND: &str = "search_brand";
 /// Body-type codes as comma-separated `u32`s (e.g. "2634" or "2634,2632").
 /// Same key-absent / key-empty / key-set semantics as `SETTING_SEARCH_BRAND`.
 pub const SETTING_SEARCH_CHASSIS: &str = "search_chassis";
+/// Gearbox codes as comma-separated `u32`s (e.g. "10795" or "3211,3212").
+/// Same shape and three-state convention as `SETTING_SEARCH_CHASSIS`.
+pub const SETTING_SEARCH_GEARBOX: &str = "search_gearbox";
 /// Model slugs, comma-separated (e.g. "cooper" or "cooper,countryman").
 /// Slug values are brand-specific and ultimately fed to the site's
 /// `model[]=...` query param. Same three-state convention.
@@ -68,6 +71,12 @@ pub struct StaticConfig {
     /// messages are logged and dropped. Never empty — enforced at load.
     pub authorized_user_ids: Vec<i64>,
     pub save_raw_html: bool,
+    /// How many search-result pages a poll cycle may fetch (#25). With the
+    /// sort pinned to newest-first, deeper pages are strictly older — the
+    /// cycle stops early on the first page with nothing unseen, so in steady
+    /// state only page 1 is fetched regardless of this cap. Extra pages only
+    /// kick in after downtime or a listing burst.
+    pub max_search_pages: u32,
     pub zero_results_alert_threshold: u32,
     /// Consecutive `fetch_search` failures before alerting to Telegram.
     /// Parallel to `zero_results_alert_threshold` but for the *fetch* leg
@@ -126,6 +135,7 @@ impl std::fmt::Debug for StaticConfig {
             .field("telegram_chat_id", &self.telegram_chat_id)
             .field("authorized_user_ids", &self.authorized_user_ids)
             .field("save_raw_html", &self.save_raw_html)
+            .field("max_search_pages", &self.max_search_pages)
             .field(
                 "zero_results_alert_threshold",
                 &self.zero_results_alert_threshold,
@@ -151,6 +161,7 @@ impl StaticConfig {
             telegram_chat_id: req_parsed::<i64>("TELEGRAM_CHAT_ID")?,
             authorized_user_ids: req_csv_parsed::<i64>("AUTHORIZED_USER_ID")?,
             save_raw_html: opt_bool("SAVE_RAW_HTML")?.unwrap_or(true),
+            max_search_pages: load_max_search_pages()?,
             zero_results_alert_threshold: opt_parsed::<u32>("ZERO_RESULTS_ALERT_THRESHOLD")?
                 .unwrap_or(3),
             fetch_errors_alert_threshold: opt_parsed::<u32>("FETCH_ERRORS_ALERT_THRESHOLD")?
@@ -227,31 +238,14 @@ impl RuntimeConfig {
             search.brand = if s.is_empty() { None } else { Some(s) };
         }
 
-        // Same three-state convention for chassis. The on-disk form is a
-        // comma-separated list of `u32`s. Empty string → no filter; absent →
-        // env-default; non-empty → these codes.
+        // Same three-state convention for the code-list filters (chassis,
+        // gearbox). The on-disk form is a comma-separated list of `u32`s.
+        // Empty string → no filter; absent → env-default; non-empty → codes.
         if let Some(s) = storage.get_setting(SETTING_SEARCH_CHASSIS)? {
-            search.chassis = if s.is_empty() {
-                Vec::new()
-            } else {
-                s.split(',')
-                    .filter_map(|p| {
-                        let part = p.trim();
-                        // A bad code in the DB (manual edit, older buggy
-                        // version) is dropped, but loudly (#29) — a silently
-                        // vanishing filter is maddening to debug.
-                        let parsed = part.parse::<u32>().ok();
-                        if parsed.is_none() {
-                            warn!(
-                                key = SETTING_SEARCH_CHASSIS,
-                                value = part,
-                                "ignoring unparseable chassis code in runtime_settings"
-                            );
-                        }
-                        parsed
-                    })
-                    .collect()
-            };
+            search.chassis = parse_stored_code_list(SETTING_SEARCH_CHASSIS, &s);
+        }
+        if let Some(s) = storage.get_setting(SETTING_SEARCH_GEARBOX)? {
+            search.gearbox = parse_stored_code_list(SETTING_SEARCH_GEARBOX, &s);
         }
 
         // Models: same shape as chassis but with `String` slugs rather than
@@ -341,6 +335,31 @@ impl RuntimeConfig {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Parses a stored comma-separated `u32` code list from `runtime_settings`
+/// (`"2634,2632"` — the on-disk form for chassis and gearbox). Empty string
+/// means "explicitly cleared" → empty list. A bad code (manual edit, older
+/// buggy version) is dropped, but loudly (#29) — a silently vanishing filter
+/// is maddening to debug.
+fn parse_stored_code_list(key: &str, s: &str) -> Vec<u32> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(',')
+        .filter_map(|p| {
+            let part = p.trim();
+            let parsed = part.parse::<u32>().ok();
+            if parsed.is_none() {
+                warn!(
+                    key,
+                    value = part,
+                    "ignoring unparseable filter code in runtime_settings"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
 /// Parses a stored range bound from `runtime_settings`. Empty string means
 /// "explicitly cleared" → `None`; a non-empty unparseable value also becomes
 /// `None` but logs a `warn!` (#29) so corrupt DB values don't silently drop
@@ -382,6 +401,7 @@ fn load_search_filter() -> Result<SearchFilter> {
         brand: opt_string("SEARCH_BRAND"),
         models: opt_csv("SEARCH_MODEL"),
         chassis: opt_csv_parsed::<u32>("SEARCH_CHASSIS")?,
+        gearbox: opt_csv_parsed::<u32>("SEARCH_GEARBOX")?,
         price_from: opt_parsed::<u32>("SEARCH_PRICE_FROM")?,
         price_to: opt_parsed::<u32>("SEARCH_PRICE_TO")?,
         year_from: opt_parsed::<u16>("SEARCH_YEAR_FROM")?,
@@ -389,6 +409,26 @@ fn load_search_filter() -> Result<SearchFilter> {
         without_price: opt_bool("SEARCH_WITHOUT_PRICE")?.unwrap_or(false),
         show_old_new: parse_show_old_new()?,
     })
+}
+
+fn load_max_search_pages() -> Result<u32> {
+    max_search_pages_or_default(opt_parsed::<u32>("MAX_SEARCH_PAGES")?)
+}
+
+/// Default 2: one page is ~25 listings, so two pages cover any realistic
+/// burst between polls (even after a few hours of downtime) while at most
+/// doubling the per-cycle traffic — and thanks to the early-stop rule the
+/// second request only happens when page 1 was entirely new.
+///
+/// Split from the env read so the test stays hermetic: asserting the default
+/// through `load_max_search_pages` would fail under an ambient
+/// `MAX_SEARCH_PAGES` in a developer's shell or CI.
+fn max_search_pages_or_default(pages: Option<u32>) -> Result<u32> {
+    let pages = pages.unwrap_or(2);
+    if pages == 0 {
+        bail!("MAX_SEARCH_PAGES=0 would fetch nothing; use 1 for single-page polling");
+    }
+    Ok(pages)
 }
 
 fn load_poll_interval() -> Result<Duration> {
@@ -592,6 +632,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_stored_code_list_handles_empty_garbage_and_valid() {
+        // Empty = explicitly cleared → no filter.
+        assert_eq!(parse_stored_code_list("k", ""), Vec::<u32>::new());
+        // A bad code is dropped (with a warn), the good ones survive.
+        assert_eq!(
+            parse_stored_code_list("k", "3210,potato,10795"),
+            vec![3210, 10795]
+        );
+        // Whitespace-tolerant, order-preserving.
+        assert_eq!(parse_stored_code_list("k", " 3212 ,3211"), vec![3212, 3211]);
+    }
+
+    #[test]
+    fn gearbox_three_state_load_absent_empty_set() {
+        // Absent key → env default; empty → explicitly cleared; set → codes.
+        // No other test reads SEARCH_GEARBOX or calls RuntimeConfig::load,
+        // so the process-global env mutation can't race.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(&dir.path().join("cfg.db")).unwrap();
+        unsafe {
+            env::set_var("SEARCH_GEARBOX", "3210");
+        }
+
+        // 1. Key absent → the env default shines through.
+        let cfg = RuntimeConfig::load(&storage).unwrap();
+        assert_eq!(cfg.search.gearbox, vec![3210]);
+
+        // 2. Key set → DB wins over env.
+        storage
+            .set_setting(SETTING_SEARCH_GEARBOX, "3212,10795")
+            .unwrap();
+        let cfg = RuntimeConfig::load(&storage).unwrap();
+        assert_eq!(cfg.search.gearbox, vec![3212, 10795]);
+
+        // 3. Key empty → explicitly cleared, env default must NOT resurface.
+        storage.set_setting(SETTING_SEARCH_GEARBOX, "").unwrap();
+        let cfg = RuntimeConfig::load(&storage).unwrap();
+        assert!(cfg.search.gearbox.is_empty());
+
+        unsafe {
+            env::remove_var("SEARCH_GEARBOX");
+        }
+    }
+
+    #[test]
     fn req_csv_parsed_accepts_single_and_multiple_ids() {
         // Single id — the pre-#9 format keeps working unchanged.
         unsafe {
@@ -641,6 +726,7 @@ mod tests {
             telegram_chat_id: 1,
             authorized_user_ids: vec![111, 222],
             save_raw_html: false,
+            max_search_pages: 1,
             zero_results_alert_threshold: 3,
             fetch_errors_alert_threshold: 3,
             dumps_dir: PathBuf::from("/tmp"),
@@ -652,6 +738,19 @@ mod tests {
         assert!(cfg.is_authorized(111));
         assert!(cfg.is_authorized(222));
         assert!(!cfg.is_authorized(333));
+    }
+
+    #[test]
+    fn max_search_pages_defaults_to_two_and_rejects_zero() {
+        // Pure helper, deliberately no env: the real MAX_SEARCH_PAGES key may
+        // be set in the ambient environment, and touching it here would break
+        // the module's distinct-keys-per-test convention.
+        assert_eq!(max_search_pages_or_default(None).unwrap(), 2, "default");
+        assert_eq!(max_search_pages_or_default(Some(3)).unwrap(), 3);
+        assert!(
+            max_search_pages_or_default(Some(0)).is_err(),
+            "0 pages fetches nothing"
+        );
     }
 
     #[test]

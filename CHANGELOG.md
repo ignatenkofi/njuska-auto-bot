@@ -11,7 +11,10 @@ Releases come from tag pushes (`v*`) — see [README → Cutting a release](READ
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Pagination + pinned newest-first sort (#25). Every search URL now carries `sort=renewDate_desc`, and a poll cycle can fetch up to `MAX_SEARCH_PAGES` pages (default 2), stopping early at the first page with nothing unseen — so steady state stays one request per cycle. Pages within a cycle are spaced by a 1 s politeness delay; HTML dumps get a `-pN` page suffix (`HHMMSS-p1.html`); "zero listings" for the streak alert means zero across all fetched pages.
+- Transmission (gearbox) filter (#7). New multi-select "КПП" section in the `/filter` wizard (4 site options: manual 4/5/6-speed, automatic/semi-automatic), rendered as labels in `/status` and the filter summary. Maps to the site's `gearbox[]=…` param; persisted in `runtime_settings` with the same absent/empty/set semantics as chassis; env escape hatch `SEARCH_GEARBOX`.
 
 ---
 

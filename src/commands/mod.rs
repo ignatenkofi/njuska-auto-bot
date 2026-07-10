@@ -45,21 +45,22 @@ use crate::storage::Storage;
 
 use catalog::{PRICE_RANGES, YEAR_RANGES, models_for_brand};
 use handlers::{
-    apply_brand, apply_chassis, apply_interval, apply_models, apply_price_range, apply_reset_all,
-    apply_year_range, format_cancel, format_filter_menu_body, format_filter_ru, format_start,
-    format_status, handle_clear, handle_clear_confirm, handle_diag, handle_dump,
+    apply_brand, apply_chassis, apply_gearbox, apply_interval, apply_models, apply_price_range,
+    apply_reset_all, apply_year_range, format_cancel, format_filter_menu_body, format_filter_ru,
+    format_start, format_status, handle_clear, handle_clear_confirm, handle_diag, handle_dump,
     handle_filter_start, handle_interval, handle_pause, handle_resume, handle_set_brand,
     models_picker_title,
 };
 use keyboards::{
     CB_FILTER_BRAND_CLEAR, CB_FILTER_BRAND_CUSTOM_HINT, CB_FILTER_BRAND_PICKER,
     CB_FILTER_BRAND_SET_PREFIX, CB_FILTER_CHASSIS_PICKER, CB_FILTER_CHASSIS_SAVE,
-    CB_FILTER_CHASSIS_TOGGLE_PREFIX, CB_FILTER_DONE, CB_FILTER_INTERVAL_PICKER,
+    CB_FILTER_CHASSIS_TOGGLE_PREFIX, CB_FILTER_DONE, CB_FILTER_GEARBOX_PICKER,
+    CB_FILTER_GEARBOX_SAVE, CB_FILTER_GEARBOX_TOGGLE_PREFIX, CB_FILTER_INTERVAL_PICKER,
     CB_FILTER_INTERVAL_SET_PREFIX, CB_FILTER_MENU, CB_FILTER_MODELS_PICKER, CB_FILTER_MODELS_SAVE,
     CB_FILTER_MODELS_TOGGLE_PREFIX, CB_FILTER_PRICE_PICKER, CB_FILTER_RANGE_SET_PREFIX,
     CB_FILTER_RESET_APPLY, CB_FILTER_RESET_CONFIRM, CB_FILTER_TODO, CB_FILTER_YEAR_PICKER,
-    brand_picker_keyboard, chassis_picker_keyboard, filter_menu_keyboard, interval_picker_keyboard,
-    model_picker_keyboard, range_picker_keyboard, reset_confirm_keyboard,
+    brand_picker_keyboard, chassis_picker_keyboard, filter_menu_keyboard, gearbox_picker_keyboard,
+    interval_picker_keyboard, model_picker_keyboard, range_picker_keyboard, reset_confirm_keyboard,
 };
 
 /// Commands the bot understands.
@@ -167,6 +168,9 @@ pub struct CommandContext {
     /// In-flight model selections. Same shape as `chassis_draft` but with
     /// `String` slugs (since model slugs are textual).
     pub models_draft: Arc<Mutex<HashMap<i64, Vec<String>>>>,
+    /// In-flight gearbox selections (#7). Same shape and lifecycle as
+    /// `chassis_draft` — numeric codes, per-user, discarded on Back.
+    pub gearbox_draft: Arc<Mutex<HashMap<i64, Vec<u32>>>>,
     /// Timestamp of the most recent `/clear` that's still awaiting confirmation.
     /// `None` means no pending request. `Some(t)` is valid for
     /// `CLEAR_CONFIRM_WINDOW` after `t`; afterwards the next `/clear_confirm`
@@ -359,6 +363,7 @@ fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn discard_drafts(ctx: &CommandContext, user_id: i64) {
     lock_unpoisoned(&ctx.chassis_draft).remove(&user_id);
     lock_unpoisoned(&ctx.models_draft).remove(&user_id);
+    lock_unpoisoned(&ctx.gearbox_draft).remove(&user_id);
 }
 
 /// Flips `item` in `user_id`'s draft (creating an empty draft on first use)
@@ -479,6 +484,29 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 .remove(&user_id)
                 .unwrap_or_default();
             apply_chassis(&ctx, draft).await;
+            let (search, interval_secs) = {
+                let r = ctx.runtime.read().await;
+                (r.search.clone(), r.poll_interval.as_secs())
+            };
+            (
+                format_filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard()),
+            )
+        }
+        CB_FILTER_GEARBOX_PICKER => {
+            // Same open-with-current-selection dance as the chassis picker.
+            let initial = ctx.runtime.read().await.search.gearbox.clone();
+            lock_unpoisoned(&ctx.gearbox_draft).insert(user_id, initial.clone());
+            (
+                "Выбери типы КПП (можно несколько):".to_string(),
+                Some(gearbox_picker_keyboard(&initial)),
+            )
+        }
+        CB_FILTER_GEARBOX_SAVE => {
+            let draft = lock_unpoisoned(&ctx.gearbox_draft)
+                .remove(&user_id)
+                .unwrap_or_default();
+            apply_gearbox(&ctx, draft).await;
             let (search, interval_secs) = {
                 let r = ctx.runtime.read().await;
                 (r.search.clone(), r.poll_interval.as_secs())
@@ -713,6 +741,17 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             (
                 "Выбери типы кузова (можно несколько):".to_string(),
                 Some(chassis_picker_keyboard(&new_state)),
+            )
+        }
+        s if s.starts_with(CB_FILTER_GEARBOX_TOGGLE_PREFIX) => {
+            let Ok(code) = s[CB_FILTER_GEARBOX_TOGGLE_PREFIX.len()..].parse::<u32>() else {
+                warn!(unknown = s, "gearbox toggle with non-numeric code");
+                return Ok(());
+            };
+            let new_state = toggle_in_draft(&ctx.gearbox_draft, user_id, code);
+            (
+                "Выбери типы КПП (можно несколько):".to_string(),
+                Some(gearbox_picker_keyboard(&new_state)),
             )
         }
         other => {

@@ -15,13 +15,14 @@ use tracing::{info, warn};
 
 use crate::config::{
     MIN_POLL_INTERVAL_SECS, SETTING_PAUSED, SETTING_POLL_INTERVAL_SECS, SETTING_SEARCH_BRAND,
-    SETTING_SEARCH_CHASSIS, SETTING_SEARCH_MODELS, SETTING_SEARCH_PRICE_FROM,
-    SETTING_SEARCH_PRICE_TO, SETTING_SEARCH_YEAR_FROM, SETTING_SEARCH_YEAR_TO,
+    SETTING_SEARCH_CHASSIS, SETTING_SEARCH_GEARBOX, SETTING_SEARCH_MODELS,
+    SETTING_SEARCH_PRICE_FROM, SETTING_SEARCH_PRICE_TO, SETTING_SEARCH_YEAR_FROM,
+    SETTING_SEARCH_YEAR_TO,
 };
 use crate::models::SearchFilter;
 use crate::telegram::{escape_html, escape_html_attr};
 
-use super::catalog::chassis_label;
+use super::catalog::{chassis_label, gearbox_label};
 use super::keyboards::filter_menu_keyboard;
 use super::{CLEAR_CONFIRM_WINDOW, CommandContext, lock_unpoisoned};
 
@@ -95,6 +96,18 @@ pub(super) fn format_filter_ru(f: &SearchFilter) -> String {
             f.chassis
                 .iter()
                 .map(|c| chassis_label(*c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
+    lines.push(format!(
+        "• КПП: <code>{}</code>",
+        if f.gearbox.is_empty() {
+            "—".to_string()
+        } else {
+            f.gearbox
+                .iter()
+                .map(|g| gearbox_label(*g))
                 .collect::<Vec<_>>()
                 .join(", ")
         }
@@ -533,6 +546,7 @@ pub(super) async fn apply_reset_all(ctx: &CommandContext) {
         SETTING_SEARCH_BRAND,
         SETTING_SEARCH_MODELS,
         SETTING_SEARCH_CHASSIS,
+        SETTING_SEARCH_GEARBOX,
         SETTING_SEARCH_PRICE_FROM,
         SETTING_SEARCH_PRICE_TO,
         SETTING_SEARCH_YEAR_FROM,
@@ -549,6 +563,7 @@ pub(super) async fn apply_reset_all(ctx: &CommandContext) {
         r.search.brand = None;
         r.search.models.clear();
         r.search.chassis.clear();
+        r.search.gearbox.clear();
         r.search.price_from = None;
         r.search.price_to = None;
         r.search.year_from = None;
@@ -614,6 +629,35 @@ pub(super) async fn apply_chassis(ctx: &CommandContext, new_chassis: Vec<u32>) {
         ?old_chassis,
         ?new_chassis,
         "chassis changed via /filter dialog"
+    );
+}
+
+/// Writes the new gearbox list to DB + runtime + wakes the poll loop.
+/// Same on-disk format and persistence-first pattern as `apply_chassis`.
+pub(super) async fn apply_gearbox(ctx: &CommandContext, new_gearbox: Vec<u32>) {
+    let stored_value = new_gearbox
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if let Err(e) = ctx
+        .storage
+        .set_setting(SETTING_SEARCH_GEARBOX, &stored_value)
+    {
+        warn!(error = %e, "couldn't persist search_gearbox");
+        return;
+    }
+    let old_gearbox = {
+        let mut r = ctx.runtime.write().await;
+        let old = r.search.gearbox.clone();
+        r.search.gearbox = new_gearbox.clone();
+        old
+    };
+    ctx.runtime_changed.notify_one();
+    info!(
+        ?old_gearbox,
+        ?new_gearbox,
+        "gearbox changed via /filter dialog"
     );
 }
 
@@ -738,11 +782,27 @@ mod tests {
     }
 
     #[test]
+    fn filter_summary_renders_gearbox_as_labels() {
+        // Known codes render as their Russian labels; out-of-catalog codes
+        // (env escape hatch) pass through raw — same contract as chassis.
+        let f = SearchFilter {
+            gearbox: vec![10795, 8888],
+            ..Default::default()
+        };
+        let s = format_filter_ru(&f);
+        assert!(
+            s.contains("КПП: <code>Автомат / полуавтомат, 8888</code>"),
+            "{s}"
+        );
+    }
+
+    #[test]
     fn filter_summary_renders_dashes_for_empty_filter() {
         let s = format_filter_ru(&SearchFilter::default());
         // Every unset field shows an em-dash placeholder, not an empty gap.
         assert!(s.contains("Марка: <code>—</code>"), "{s}");
         assert!(s.contains("Модели: <code>—</code>"), "{s}");
+        assert!(s.contains("КПП: <code>—</code>"), "{s}");
         assert!(s.contains("Цена: <code>— – —</code>"), "{s}");
     }
 
