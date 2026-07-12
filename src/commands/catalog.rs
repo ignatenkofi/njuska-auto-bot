@@ -22,6 +22,18 @@ pub(super) const CHASSIS: &[(u32, &str)] = &[
     (2634, "Кабриолет"),
 ];
 
+/// Gearbox catalog: `(numeric_code, display_name)`. Codes come from the
+/// site's `<select name="gearbox[]">` filter — unlike chassis this is the
+/// **complete** list, so there's no `.env`-only exotic tail here (the env
+/// escape hatch `SEARCH_GEARBOX` still exists for symmetry with the other
+/// filters). Russian labels, same rationale as [`CHASSIS`].
+pub(super) const GEARBOX: &[(u32, &str)] = &[
+    (3210, "Механика (4 ст.)"),
+    (3211, "Механика (5 ст.)"),
+    (3212, "Механика (6 ст.)"),
+    (10795, "Автомат / полуавтомат"),
+];
+
 /// Predefined poll-interval presets in seconds. The minimum (60s) matches
 /// `MIN_POLL_INTERVAL_SECS` so the picker never offers an illegal value.
 /// For non-preset intervals, the user can still type `/interval N`.
@@ -330,6 +342,17 @@ pub(super) fn chassis_label(code: u32) -> String {
         .unwrap_or_else(|| code.to_string())
 }
 
+/// Reverse lookup: gearbox code → human label from the [`GEARBOX`] catalog.
+/// Same raw-number fallback as [`chassis_label`] for out-of-catalog codes
+/// coming from `SEARCH_GEARBOX` in `.env`.
+pub(super) fn gearbox_label(code: u32) -> String {
+    GEARBOX
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| code.to_string())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
@@ -341,6 +364,14 @@ mod tests {
         assert_eq!(chassis_label(2632), "Внедорожник");
         // Not in the catalog (e.g. set via SEARCH_CHASSIS in .env) — raw code.
         assert_eq!(chassis_label(9999), "9999");
+    }
+
+    #[test]
+    fn gearbox_label_maps_known_codes_and_passes_through_unknown() {
+        assert_eq!(gearbox_label(3211), "Механика (5 ст.)");
+        assert_eq!(gearbox_label(10795), "Автомат / полуавтомат");
+        // Out-of-catalog code from SEARCH_GEARBOX in .env — raw code.
+        assert_eq!(gearbox_label(9999), "9999");
     }
 
     #[test]

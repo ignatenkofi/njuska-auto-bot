@@ -62,6 +62,12 @@ teloxide = { version = "0.17", features = ["macros"] }
 # so they don't touch the real database file.
 tempfile = "3"
 
+# `test-util` enables `#[tokio::test(start_paused = true)]`: paused time
+# auto-advances through `sleep`, so the pagination tests don't spend real
+# seconds in the between-page politeness delay. Feature unification adds it
+# on top of the "full" set from [dependencies] for test builds only.
+tokio = { version = "1", features = ["test-util"] }
+
 # Project rule (CLAUDE.md): no unwrap/expect in production paths. Enforced by
 # the compiler rather than review vigilance (#23). The handful of justified
 # uses (poisoned-mutex expects, compile-time constants) carry an explicit

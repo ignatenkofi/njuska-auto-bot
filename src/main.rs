@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
     let static_cfg = Arc::new(StaticConfig::from_env().context("loading static config from env")?);
     info!(
         save_raw_html = static_cfg.save_raw_html,
+        max_search_pages = static_cfg.max_search_pages,
         zero_results_threshold = static_cfg.zero_results_alert_threshold,
         dump_retention_days = static_cfg.dump_retention_days,
         "static config loaded"
@@ -91,6 +92,7 @@ async fn main() -> Result<()> {
         brand = ?runtime_initial.search.brand,
         models = ?runtime_initial.search.models,
         chassis = ?runtime_initial.search.chassis,
+        gearbox = ?runtime_initial.search.gearbox,
         "runtime config loaded"
     );
     let runtime = Arc::new(RwLock::new(runtime_initial));
@@ -118,6 +120,8 @@ async fn main() -> Result<()> {
     // Same shape for models. Decoupled draft maps make it cheap to add more
     // multi-select pickers later (e.g. fuel types) without state collisions.
     let models_draft = Arc::new(Mutex::new(HashMap::new()));
+    // ...which is exactly how gearbox (#7) slotted in.
+    let gearbox_draft = Arc::new(Mutex::new(HashMap::new()));
 
     // ----- Spawn the poll loop -----
     // The tasks return their `Result` instead of swallowing it: main is the
@@ -144,6 +148,7 @@ async fn main() -> Result<()> {
             pending_clear: pending_clear.clone(),
             chassis_draft: chassis_draft.clone(),
             models_draft: models_draft.clone(),
+            gearbox_draft: gearbox_draft.clone(),
         };
         async move { commands::run_command_loop(bot, ctx).await }
     });

@@ -8,7 +8,7 @@
 
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-use super::catalog::{BRANDS, CHASSIS, INTERVAL_PRESETS};
+use super::catalog::{BRANDS, CHASSIS, GEARBOX, INTERVAL_PRESETS};
 
 /// Show the top-level filter menu.
 pub(super) const CB_FILTER_MENU: &str = "f:menu";
@@ -50,6 +50,11 @@ pub(super) const CB_FILTER_CHASSIS_PICKER: &str = "f:chassis_picker";
 pub(super) const CB_FILTER_CHASSIS_TOGGLE_PREFIX: &str = "f:chassis_toggle:";
 pub(super) const CB_FILTER_CHASSIS_SAVE: &str = "f:chassis_save";
 
+// Gearbox multi-select picker (#7) — same open/toggle/save shape as chassis.
+pub(super) const CB_FILTER_GEARBOX_PICKER: &str = "f:gearbox_picker";
+pub(super) const CB_FILTER_GEARBOX_TOGGLE_PREFIX: &str = "f:gearbox_toggle:";
+pub(super) const CB_FILTER_GEARBOX_SAVE: &str = "f:gearbox_save";
+
 // Price + year range pickers. Single-tap commits — no draft state because each
 // button carries the *complete* new range, unlike chassis where the user
 // builds up a multi-select set.
@@ -79,12 +84,16 @@ pub(super) fn filter_menu_keyboard() -> InlineKeyboardMarkup {
         ],
         vec![
             InlineKeyboardButton::callback("✏️ Кузов", CB_FILTER_CHASSIS_PICKER),
-            InlineKeyboardButton::callback("✏️ Цена", CB_FILTER_PRICE_PICKER),
+            InlineKeyboardButton::callback("✏️ КПП", CB_FILTER_GEARBOX_PICKER),
         ],
         vec![
+            InlineKeyboardButton::callback("✏️ Цена", CB_FILTER_PRICE_PICKER),
             InlineKeyboardButton::callback("✏️ Год", CB_FILTER_YEAR_PICKER),
-            InlineKeyboardButton::callback("⏱ Интервал", CB_FILTER_INTERVAL_PICKER),
         ],
+        vec![InlineKeyboardButton::callback(
+            "⏱ Интервал",
+            CB_FILTER_INTERVAL_PICKER,
+        )],
         vec![
             InlineKeyboardButton::callback("🧹 Сбросить", CB_FILTER_RESET_CONFIRM),
             InlineKeyboardButton::callback("✅ Готово", CB_FILTER_DONE),
@@ -252,6 +261,36 @@ pub(super) fn chassis_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup 
     InlineKeyboardMarkup::new(rows)
 }
 
+/// Gearbox picker keyboard (#7): same multi-select shape as the chassis
+/// picker (✓/⬜ prefixes, toggle callbacks, Save/Back row) over the 4-entry
+/// [`GEARBOX`] catalog.
+pub(super) fn gearbox_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = GEARBOX
+        .chunks(2)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|(code, display)| {
+                    let prefix = if selected.contains(code) {
+                        "✓ "
+                    } else {
+                        "⬜ "
+                    };
+                    InlineKeyboardButton::callback(
+                        format!("{prefix}{display}"),
+                        format!("{CB_FILTER_GEARBOX_TOGGLE_PREFIX}{code}"),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    rows.push(vec![
+        InlineKeyboardButton::callback("💾 Сохранить", CB_FILTER_GEARBOX_SAVE),
+        InlineKeyboardButton::callback("↩️ Назад (без сохранения)", CB_FILTER_MENU),
+    ]);
+    InlineKeyboardMarkup::new(rows)
+}
+
 /// Brand picker: a 4-wide grid of brand buttons plus "skip" and "back".
 ///
 /// `chunks(4)` cleanly groups the 20 brands into 5 rows of 4. If the list
@@ -311,6 +350,7 @@ mod tests {
             filter_menu_keyboard(),
             brand_picker_keyboard(),
             chassis_picker_keyboard(&[2634]),
+            gearbox_picker_keyboard(&[10795]),
             interval_picker_keyboard(600),
             reset_confirm_keyboard(),
             range_picker_keyboard("price", PRICE_RANGES, (None, None)),
@@ -388,6 +428,24 @@ mod tests {
     }
 
     #[test]
+    fn gearbox_buttons_round_trip_codes_and_show_selection() {
+        let kb = gearbox_picker_keyboard(&[10795]);
+        let mut toggles = 0;
+        for btn in all_buttons(&kb) {
+            let Some(tail) = data(btn).strip_prefix(CB_FILTER_GEARBOX_TOGGLE_PREFIX) else {
+                continue; // Save / Back row
+            };
+            toggles += 1;
+            let code = tail.parse::<u32>().unwrap();
+            let checked = btn.text.starts_with("✓ ");
+            assert_eq!(checked, code == 10795, "{}", btn.text);
+        }
+        // The site's gearbox list is complete — every catalog entry must be
+        // a button.
+        assert_eq!(toggles, GEARBOX.len());
+    }
+
+    #[test]
     fn model_buttons_round_trip_slugs_and_show_selection() {
         let models = super::super::catalog::models_for_brand("mini").unwrap();
         let kb = model_picker_keyboard(models, &["cooper".to_string()]);
@@ -423,6 +481,7 @@ mod tests {
         let keyboards = [
             brand_picker_keyboard(),
             chassis_picker_keyboard(&[]),
+            gearbox_picker_keyboard(&[]),
             interval_picker_keyboard(600),
             reset_confirm_keyboard(),
             range_picker_keyboard("price", PRICE_RANGES, (None, None)),

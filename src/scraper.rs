@@ -85,10 +85,10 @@ impl ScraperError {
     }
 }
 
-/// [`fetch_search`] wrapped in up-to-`attempts` tries with a short doubling
-/// backoff (1s, 2s, …) on *transient* errors only. Non-transient errors
-/// (403, malformed responses) return immediately — retrying those just
-/// delays the diagnosis.
+/// [`fetch_search`] (always page 1 — probes don't paginate) wrapped in
+/// up-to-`attempts` tries with a short doubling backoff (1s, 2s, …) on
+/// *transient* errors only. Non-transient errors (403, malformed responses)
+/// return immediately — retrying those just delays the diagnosis.
 ///
 /// Used by the startup proxy health-check (#13); `/diag` shares the same
 /// path with `attempts = 1` for a one-shot probe (#2).
@@ -103,7 +103,7 @@ pub async fn fetch_with_retries(
     // whatever happens. Backoff stays tiny because callers (startup probe)
     // want a verdict in seconds — the poll loop has its own long backoff.
     for attempt in 1..attempts {
-        match fetch_search(filter, proxy).await {
+        match fetch_search(filter, proxy, 1).await {
             Ok(html) => return Ok(html),
             Err(e) if e.is_transient() => {
                 tracing::warn!(attempt, error = %e, "transient fetch error; retrying after backoff");
@@ -113,10 +113,14 @@ pub async fn fetch_with_retries(
             Err(e) => return Err(e),
         }
     }
-    fetch_search(filter, proxy).await
+    fetch_search(filter, proxy, 1).await
 }
 
-/// Fetches the search-results page for the given filter and returns the raw HTML.
+/// Fetches one search-results page (1-based `page`) for the given filter and
+/// returns the raw HTML. Fetching stays single-page on purpose — the
+/// pagination loop lives in the poll cycle (`bot::run_one_cycle`), which owns
+/// the "stop once nothing is unseen" decision; this module never needs to
+/// know storage exists.
 ///
 /// **Implementation: shells out to system `curl`.** Why not `reqwest`?
 ///
@@ -145,8 +149,9 @@ pub async fn fetch_with_retries(
 pub async fn fetch_search(
     filter: &SearchFilter,
     proxy: Option<&ProxyConfig>,
+    page: u32,
 ) -> Result<String, ScraperError> {
-    let original_url = filter.to_url();
+    let original_url = filter.to_url_for_page(page);
     // When a proxy is configured, swap host+scheme with the Worker's URL but
     // keep path + query intact — that's what the Worker forwards verbatim.
     let request_url = match proxy {
@@ -161,6 +166,7 @@ pub async fn fetch_search(
 
     debug!(
         url = %request_url,
+        page,
         via_proxy = proxy.is_some(),
         "fetching search page via curl"
     );
@@ -397,6 +403,12 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/search_mini_cooper_cabrio.html");
+    /// Synthetic "page 2": the real fixture with every listing id shifted by
+    /// +50_000_000 (see the file's header comment). Used by the pagination
+    /// integration tests; pinned here so a regenerated derivation that drifts
+    /// (id collisions, broken markup) fails fast.
+    const FIXTURE_PAGE2: &str =
+        include_str!("../tests/fixtures/search_mini_cooper_cabrio_page2.html");
 
     #[test]
     fn parses_expected_number_of_listings() {
@@ -466,6 +478,21 @@ mod tests {
                 l.id
             );
         }
+    }
+
+    #[test]
+    fn derived_page2_fixture_parses_with_ids_disjoint_from_page1() {
+        use std::collections::HashSet;
+
+        let page1_ids: HashSet<u64> = parse_listings(FIXTURE).iter().map(|l| l.id).collect();
+        let page2 = parse_listings(FIXTURE_PAGE2);
+        assert_eq!(page2.len(), 14, "derivation must keep all 14 cards");
+        assert!(
+            page2.iter().all(|l| !page1_ids.contains(&l.id)),
+            "page-2 ids must not collide with page 1"
+        );
+        // Spot-check the uniform +50M shift on the known listing.
+        assert!(page2.iter().any(|l| l.id == 77_312_553));
     }
 
     #[test]
