@@ -59,8 +59,12 @@ together. Keep new code in the library side.
 
 ## Adding a filter section to `/filter`
 
-Follow the pattern of an existing section in `src/commands.rs` — pick the
-closest shape:
+The dispatcher lives in `src/commands/`, split per the ~300-line rule:
+`mod.rs` (routing — `handle_command`/`handle_callback`), `catalog.rs`
+(static data), `keyboards.rs` (keyboard builders + callback-data constants),
+`handlers.rs` (per-command handlers, `apply_*`, formatters).
+
+Follow the pattern of an existing section — pick the closest shape:
 
 - **single-select** → brand picker (`CB_FILTER_BRAND_*`)
 - **multi-select** → chassis picker (`CB_FILTER_CHASSIS_*`, draft slot in
@@ -69,19 +73,21 @@ closest shape:
 
 The steps are always the same:
 
-1. Catalog constant (`const FOO: &[…]`) near the top of `commands.rs`.
-2. Callback-data constants in the `f:` namespace (Telegram caps callback
-   data at 64 bytes — keep them short).
-3. Keyboard builder fn + branch(es) in `handle_callback`.
-4. An `apply_foo()` that **persists to `runtime_settings` first, then
+1. Catalog constant (`const FOO: &[…]`) in `commands/catalog.rs`.
+2. Callback-data constants in the `f:` namespace in `commands/keyboards.rs`
+   (Telegram caps callback data at 64 bytes — keep them short).
+3. Keyboard builder fn in `commands/keyboards.rs` + routing branch(es) in
+   `handle_callback` (`commands/mod.rs`).
+4. An `apply_foo()` in `commands/handlers.rs` that **persists to
+   `runtime_settings` first, then
    mutates `RuntimeConfig`, then calls `runtime_changed.notify_one()`** —
    persist-first is the invariant that keeps RAM and DB consistent on a
    failed write.
 5. A `SETTING_…` key in `config.rs` plus the three-state merge in
    `RuntimeConfig::load` (absent key = env default, empty = explicitly
    cleared, value = user's choice).
-6. Render the field in `format_filter_ru`, escape anything user-supplied
-   with `telegram::escape_html`.
+6. Render the field in `format_filter_ru` (`commands/handlers.rs`), escape
+   anything user-supplied with `telegram::escape_html`.
 7. Add `.env` fallback support in `config.rs` and document it in
    `.env.example`.
 

@@ -146,13 +146,13 @@ when something crosses ~300 lines or splits naturally.
 
 | File | Responsibility |
 | --- | --- |
-| `main.rs` | Entry — load env, init tracing, spawn poll + command loops, `tokio::join!` |
+| `main.rs` | Entry — load env, init tracing, spawn poll + command loops, supervise them with `tokio::select!` |
 | `config.rs` | `StaticConfig` (env-only) + `RuntimeConfig` (env defaults + DB overrides) + `ProxyConfig` |
 | `models.rs` | Shared types — `Listing`, `SearchFilter`, `ShowOldNew` |
 | `scraper.rs` | curl shell-out (optional CF Worker proxy) + HTML parsing via CSS selectors |
 | `storage.rs` | SQLite via `rusqlite` — `seen_listings` (dedup) + `runtime_settings` (user config) |
 | `telegram.rs` | teloxide-based send-only client (`format_listing_html`, `escape_html`) |
-| `commands.rs` | teloxide dispatcher — commands + inline keyboards + callback routing |
+| `commands/` | teloxide dispatcher, split per the ~300-line rule: `mod.rs` (`Command` enum, `CommandContext`, `run_command_loop`, `handle_command`/`handle_callback` routing), `catalog.rs` (brand/model/body-type data + preset ranges), `keyboards.rs` (inline-keyboard builders + callback-data constants), `handlers.rs` (per-command handlers, `apply_*` state changes, formatters) |
 | `signals.rs` | SIGINT/SIGTERM handler shared between both loops |
 | `bot.rs` | The poll loop — fetch / dedup / send + zero-streak detector + dump rotation |
 
@@ -282,7 +282,7 @@ A few decisions worth knowing about, in case you read the source:
 ## Contributing
 
 PRs welcome. The bot is intentionally minimal — if you want to add a new
-filter section, follow the pattern of an existing one in `commands.rs`
+filter section, follow the pattern of an existing one in `src/commands/`
 (brand picker for single-select, chassis picker for multi-select, range
 picker for from/to ranges).
 
