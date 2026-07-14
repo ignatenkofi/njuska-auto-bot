@@ -44,8 +44,9 @@ person in their spare time. Realistically:
 
 Things that are *known and accepted* trade-offs, not vulnerabilities:
 
-- The bot trusts its single configured operator (`AUTHORIZED_USER_ID`);
-  there is no multi-user permission model.
+- The bot trusts every configured operator in `AUTHORIZED_USER_ID` (a single
+  id or a comma-separated list) equally; there are no per-user roles or
+  permission tiers — anyone on the list can run every command.
 - HTML fetched from polovniautomobili.com is treated as untrusted input;
   escaping bugs in what the bot forwards to Telegram **are** in scope.
 - Secrets live in `.env` / systemd environment on the deployment box —
