@@ -37,7 +37,7 @@ OpenSSL), so the only thing it needs from the OS is `curl` (for fetching)
 and libc.
 
 > **No Rust toolchain on the VM.** We build the binary on GitHub Actions
-> and the VM just downloads it from the `nightly` release. Saves a few GB of
+> and the VM just downloads it from the latest tagged release. Saves a few GB of
 > disk and a few minutes per upgrade.
 
 ## Step 3 — Create a dedicated user
