@@ -292,22 +292,7 @@ impl RuntimeConfig {
 
         let mut poll_interval = load_poll_interval()?;
         if let Some(s) = storage.get_setting(SETTING_POLL_INTERVAL_SECS)? {
-            match s.parse::<u64>() {
-                Ok(secs) if secs >= MIN_POLL_INTERVAL_SECS => {
-                    poll_interval = Duration::from_secs(secs);
-                }
-                Ok(secs) => warn!(
-                    key = SETTING_POLL_INTERVAL_SECS,
-                    value = secs,
-                    min = MIN_POLL_INTERVAL_SECS,
-                    "stored poll interval below minimum; keeping env/default value"
-                ),
-                Err(_) => warn!(
-                    key = SETTING_POLL_INTERVAL_SECS,
-                    value = %s,
-                    "unparseable poll interval in runtime_settings; keeping env/default value"
-                ),
-            }
+            poll_interval = parse_stored_poll_interval(poll_interval, &s);
         }
 
         // `paused` is pure-runtime: no env knob, defaults to false.
@@ -382,11 +367,58 @@ where
     parsed
 }
 
+/// Range-checks a stored `/interval` override from `runtime_settings` against
+/// the env/default `fallback`. An out-of-range or unparseable value (manual
+/// DB edit, older buggy version) loses to the fallback — loudly, same
+/// contract as [`parse_stored_bound`]. Split from [`RuntimeConfig::load`] so
+/// the bounds policy is testable without touching the process-global env
+/// (same reasoning as [`max_search_pages_or_default`]).
+fn parse_stored_poll_interval(fallback: Duration, s: &str) -> Duration {
+    match s.parse::<u64>() {
+        Ok(secs) if (MIN_POLL_INTERVAL_SECS..=MAX_POLL_INTERVAL_SECS).contains(&secs) => {
+            Duration::from_secs(secs)
+        }
+        Ok(secs) if secs < MIN_POLL_INTERVAL_SECS => {
+            warn!(
+                key = SETTING_POLL_INTERVAL_SECS,
+                value = secs,
+                min = MIN_POLL_INTERVAL_SECS,
+                "stored poll interval below minimum; keeping env/default value"
+            );
+            fallback
+        }
+        Ok(secs) => {
+            warn!(
+                key = SETTING_POLL_INTERVAL_SECS,
+                value = secs,
+                max = MAX_POLL_INTERVAL_SECS,
+                "stored poll interval above maximum; keeping env/default value"
+            );
+            fallback
+        }
+        Err(_) => {
+            warn!(
+                key = SETTING_POLL_INTERVAL_SECS,
+                value = %s,
+                "unparseable poll interval in runtime_settings; keeping env/default value"
+            );
+            fallback
+        }
+    }
+}
+
 /// Hard floor: anything below a minute is impolite to the upstream site and
 /// serves no real purpose (listings don't appear that fast). Enforced in
 /// three places — env loader, DB-override merging, and the `/interval N`
 /// command handler — so a user can't sneak below it from any direction.
 pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
+
+/// Sanity ceiling: a week between polls. Anything longer is a fat-fingered
+/// `/interval` or a corrupt stored value, not a real wish — and unbounded
+/// intervals ride the error-streak multiplier in `bot::effective_sleep`
+/// toward `Duration` overflow (#54). Enforced in the same three places as
+/// the floor.
+pub const MAX_POLL_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 
 fn load_database_path() -> PathBuf {
     // `PathBuf::from` is infallible — invalid paths only surface when
@@ -435,6 +467,11 @@ fn load_poll_interval() -> Result<Duration> {
     let secs = opt_parsed::<u64>("POLL_INTERVAL_SECS")?.unwrap_or(600);
     if secs < MIN_POLL_INTERVAL_SECS {
         bail!("POLL_INTERVAL_SECS={secs} is below the minimum {MIN_POLL_INTERVAL_SECS}");
+    }
+    // Reject rather than clamp, like the floor: `.env` is operator-owned, and
+    // failing fast at startup beats silently running with a guessed value.
+    if secs > MAX_POLL_INTERVAL_SECS {
+        bail!("POLL_INTERVAL_SECS={secs} is above the maximum {MAX_POLL_INTERVAL_SECS} (7 days)");
     }
     Ok(Duration::from_secs(secs))
 }
@@ -642,6 +679,32 @@ mod tests {
         );
         // Whitespace-tolerant, order-preserving.
         assert_eq!(parse_stored_code_list("k", " 3212 ,3211"), vec![3212, 3211]);
+    }
+
+    #[test]
+    fn stored_poll_interval_keeps_fallback_when_out_of_range_or_garbage() {
+        let fallback = Duration::from_secs(600);
+        // An in-range override wins over the env/default value…
+        assert_eq!(
+            parse_stored_poll_interval(fallback, "3600"),
+            Duration::from_secs(3600)
+        );
+        // …and both bounds are themselves legal (off-by-one guard).
+        assert_eq!(
+            parse_stored_poll_interval(fallback, &MIN_POLL_INTERVAL_SECS.to_string()),
+            Duration::from_secs(MIN_POLL_INTERVAL_SECS)
+        );
+        assert_eq!(
+            parse_stored_poll_interval(fallback, &MAX_POLL_INTERVAL_SECS.to_string()),
+            Duration::from_secs(MAX_POLL_INTERVAL_SECS)
+        );
+        // Below the floor, absurdly huge (u64::MAX is the #54 overflow
+        // input), and garbage all keep the fallback instead of poisoning
+        // the poll loop's sleep math.
+        let absurd = u64::MAX.to_string();
+        for bad in ["5", absurd.as_str(), "potato"] {
+            assert_eq!(parse_stored_poll_interval(fallback, bad), fallback, "{bad}");
+        }
     }
 
     #[test]

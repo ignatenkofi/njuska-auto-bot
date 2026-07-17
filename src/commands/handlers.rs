@@ -14,8 +14,8 @@ use teloxide::types::ParseMode;
 use tracing::{info, warn};
 
 use crate::config::{
-    MIN_POLL_INTERVAL_SECS, SETTING_PAUSED, SETTING_POLL_INTERVAL_SECS, SETTING_SEARCH_BRAND,
-    SETTING_SEARCH_CHASSIS, SETTING_SEARCH_GEARBOX, SETTING_SEARCH_MODELS,
+    MAX_POLL_INTERVAL_SECS, MIN_POLL_INTERVAL_SECS, SETTING_PAUSED, SETTING_POLL_INTERVAL_SECS,
+    SETTING_SEARCH_BRAND, SETTING_SEARCH_CHASSIS, SETTING_SEARCH_GEARBOX, SETTING_SEARCH_MODELS,
     SETTING_SEARCH_PRICE_FROM, SETTING_SEARCH_PRICE_TO, SETTING_SEARCH_YEAR_FROM,
     SETTING_SEARCH_YEAR_TO,
 };
@@ -337,6 +337,11 @@ pub(super) async fn apply_interval(ctx: &CommandContext, secs: u64) -> Result<u6
     if secs < MIN_POLL_INTERVAL_SECS {
         return Err(format!(
             "Минимум <b>{MIN_POLL_INTERVAL_SECS}</b> секунд — это вежливость к сайту."
+        ));
+    }
+    if secs > MAX_POLL_INTERVAL_SECS {
+        return Err(format!(
+            "Максимум <b>{MAX_POLL_INTERVAL_SECS}</b> секунд (неделя) — больше похоже на опечатку."
         ));
     }
 
@@ -769,6 +774,15 @@ pub(super) fn usage_hint(text: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::{Notify, RwLock};
+
+    use crate::config::{RuntimeConfig, StaticConfig};
+    use crate::storage::Storage;
+
     use super::*;
 
     #[test]
@@ -959,5 +973,85 @@ mod tests {
         let msg = format_dump_message(&listings, 1);
         assert!(msg.contains('\u{202E}'), "{msg}");
         assert!(msg.contains('\u{200B}'), "{msg}");
+    }
+
+    /// A real `CommandContext` over a temp SQLite file (never the real DB),
+    /// runtime seeded at 600s — enough to exercise the `apply_*` helpers
+    /// without a live `Bot`.
+    fn test_ctx(db_path: &std::path::Path) -> CommandContext {
+        CommandContext {
+            static_cfg: Arc::new(StaticConfig {
+                database_path: db_path.to_path_buf(),
+                telegram_token: "t".into(),
+                telegram_chat_id: 1,
+                authorized_user_ids: vec![111],
+                save_raw_html: false,
+                max_search_pages: 1,
+                zero_results_alert_threshold: 3,
+                fetch_errors_alert_threshold: 3,
+                dumps_dir: PathBuf::from("/tmp"),
+                dump_retention_days: 0,
+                dump_max_total_mb: 0,
+                seen_retention_days: 0,
+                cf_proxy: None,
+            }),
+            runtime: Arc::new(RwLock::new(RuntimeConfig {
+                search: SearchFilter::default(),
+                poll_interval: Duration::from_secs(600),
+                paused: false,
+            })),
+            storage: Arc::new(Storage::new(db_path).unwrap()),
+            runtime_changed: Arc::new(Notify::new()),
+            chassis_draft: Arc::new(Mutex::new(HashMap::new())),
+            models_draft: Arc::new(Mutex::new(HashMap::new())),
+            gearbox_draft: Arc::new(Mutex::new(HashMap::new())),
+            pending_clear: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn interval_out_of_range_is_rejected_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir.path().join("cmd.db"));
+
+        // Above the ceiling (#54): a human reply naming the limit, not a
+        // silent clamp — the user should learn the rule, not guess it.
+        let err = apply_interval(&ctx, MAX_POLL_INTERVAL_SECS + 1)
+            .await
+            .unwrap_err();
+        assert!(err.contains(&MAX_POLL_INTERVAL_SECS.to_string()), "{err}");
+
+        // Below the floor: same contract, pinned here alongside the ceiling.
+        let err = apply_interval(&ctx, MIN_POLL_INTERVAL_SECS - 1)
+            .await
+            .unwrap_err();
+        assert!(err.contains(&MIN_POLL_INTERVAL_SECS.to_string()), "{err}");
+
+        // "Changes nothing" means both halves: RAM still at the seed value,
+        // and nothing persisted for the next restart to trip over.
+        assert_eq!(
+            ctx.runtime.read().await.poll_interval,
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            ctx.storage.get_setting(SETTING_POLL_INTERVAL_SECS).unwrap(),
+            None
+        );
+
+        // The ceiling itself is legal — guards the bound check against
+        // an off-by-one — and goes through RAM + DB like any valid value.
+        let old = apply_interval(&ctx, MAX_POLL_INTERVAL_SECS).await.unwrap();
+        assert_eq!(old, 600);
+        assert_eq!(
+            ctx.runtime.read().await.poll_interval,
+            Duration::from_secs(MAX_POLL_INTERVAL_SECS)
+        );
+        assert_eq!(
+            ctx.storage
+                .get_setting(SETTING_POLL_INTERVAL_SECS)
+                .unwrap()
+                .as_deref(),
+            Some(MAX_POLL_INTERVAL_SECS.to_string().as_str())
+        );
     }
 }
