@@ -15,7 +15,7 @@
 
 [Unit]
 Description=NjuskaAutoBot — polovniautomobili.com → Telegram
-Documentation=https://github.com/filipp-ignatenko/njuska-auto-bot
+Documentation=https://github.com/ignatenkofi/njuska-auto-bot
 # Wait for network to be reachable before starting (TG API needs it).
 # `network-online.target` is the right one — `network.target` only means
 # "the kernel knows about interfaces", which is too early.
