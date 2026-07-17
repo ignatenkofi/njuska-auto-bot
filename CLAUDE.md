@@ -61,14 +61,23 @@ These were agreed at project start — don't quietly drop them in a refactor:
 
 ## Project layout
 
-Flat modules under `src/`:
+Modules under `src/`:
 
-- `main.rs` — entry, tracing init, poll loop.
+- `lib.rs` — library facade so integration tests in `tests/` can link against the crate.
+- `main.rs` — entrypoint: load env, init tracing, spawn poll loop + command listener.
+- `bot.rs` — fetch/dedup/send loop, streak detectors, dump rotation.
 - `config.rs` — env -> typed `Config`.
 - `models.rs` — `Listing`, `SearchFilter`, shared types.
 - `scraper.rs` — fetch + parse.
+- `signals.rs` — SIGINT/SIGTERM handling for graceful shutdown.
 - `storage.rs` — SQLite via `rusqlite`.
 - `telegram.rs` — send-only Bot API client.
+- `version.rs` — compile-time version metadata.
+- `commands/` — Telegram command handlers:
+  - `mod.rs` — router and `CommandContext`.
+  - `handlers.rs` — individual command implementations.
+  - `catalog.rs` — brand/model catalog queries.
+  - `keyboards.rs` — inline keyboard builders.
 
 Promote a module to a directory with `mod.rs` only when it exceeds ~300 lines or splits naturally into submodules.
 
