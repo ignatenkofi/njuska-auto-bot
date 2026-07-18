@@ -95,7 +95,7 @@ pub enum Command {
     Pause,
     #[command(description = "Возобновить поллинг.")]
     Resume,
-    #[command(description = "Интервал поллинга в секундах (≥60). Пример: /interval 300")]
+    #[command(description = "Интервал поллинга в секундах (60..604800). Пример: /interval 300")]
     Interval(u64),
     #[command(description = "Подготовить очистку истории.")]
     Clear,

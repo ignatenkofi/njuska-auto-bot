@@ -419,7 +419,12 @@ fn effective_sleep(base: std::time::Duration, error_streak: u32) -> std::time::D
         1 => 2,
         _ => 4,
     };
-    base * factor
+    // `Duration * u32` panics on overflow, and this multiplication runs in
+    // [`run`] *outside* `run_one_cycle`'s error catch — such a panic would
+    // kill the loop for good (invariant 1, #54). The interval ceiling in
+    // config makes overflow unreachable today; saturating keeps invariant 1
+    // from depending on validation elsewhere staying airtight.
+    base.saturating_mul(factor)
 }
 
 /// Human-readable one-liner for a fetch failure, used in the Telegram alert
@@ -821,6 +826,18 @@ mod tests {
         assert_eq!(effective_sleep(base, 2), base * 4);
         assert_eq!(effective_sleep(base, 3), base * 4, "capped at 4x");
         assert_eq!(effective_sleep(base, 100), base * 4, "capped at 4x");
+    }
+
+    #[test]
+    fn effective_sleep_saturates_on_absurd_base_instead_of_panicking() {
+        // #54 / invariant 1: `Duration * u32` panics on overflow and this
+        // runs outside run_one_cycle's error catch, so an absurd interval
+        // must saturate, not take the loop down.
+        let base = std::time::Duration::from_secs(u64::MAX);
+        assert_eq!(effective_sleep(base, 0), base);
+        for streak in [1, 2, 3, 100] {
+            assert_eq!(effective_sleep(base, streak), std::time::Duration::MAX);
+        }
     }
 
     #[test]
