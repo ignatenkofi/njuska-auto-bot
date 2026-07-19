@@ -400,12 +400,13 @@ pub(super) async fn handle_resume(ctx: &CommandContext) -> String {
 /// within [`CLEAR_CONFIRM_WINDOW`] actually wipes. Without this gate, a
 /// fat-finger near the input bar could nuke the whole dedup set.
 ///
-/// `handle_clear` is synchronous — we only touch the Mutex<Instant>, no I/O.
-pub(super) fn handle_clear(ctx: &CommandContext) -> String {
+/// `handle_clear` is synchronous — we only touch the map, no I/O. Keyed by the
+/// sending `user_id` (#42) so each authorized user arms their own slot.
+pub(super) fn handle_clear(ctx: &CommandContext, user_id: i64) -> String {
     // `lock_unpoisoned` mirrors storage's stance: poisoning means a holder
     // panicked, which is a bug to surface loudly, not a runtime error.
     let mut pending = lock_unpoisoned(&ctx.pending_clear);
-    *pending = Some(Instant::now());
+    pending.insert(user_id, Instant::now());
 
     let count = ctx.storage.seen_count().unwrap_or(0);
     format!(
@@ -419,14 +420,16 @@ pub(super) fn handle_clear(ctx: &CommandContext) -> String {
     )
 }
 
-pub(super) async fn handle_clear_confirm(ctx: &CommandContext) -> String {
-    // Read & consume the pending timestamp in one critical section.
+pub(super) async fn handle_clear_confirm(ctx: &CommandContext, user_id: i64) -> String {
+    // Read & consume *this user's* pending timestamp in one critical section
+    // (#42): only the id that armed the `/clear` can consume it, so a second
+    // authorized user's `/clear_confirm` can't wipe on someone else's behalf.
     // Even if the deletion below failed, we still consume the pending state —
     // a failure here means a real DB problem the user needs to retry from
     // scratch, not auto-arm a second wipe attempt.
     let pending = {
         let mut p = lock_unpoisoned(&ctx.pending_clear);
-        p.take()
+        p.remove(&user_id)
     };
 
     let Some(started_at) = pending else {
@@ -1005,7 +1008,7 @@ mod tests {
             chassis_draft: Arc::new(Mutex::new(HashMap::new())),
             models_draft: Arc::new(Mutex::new(HashMap::new())),
             gearbox_draft: Arc::new(Mutex::new(HashMap::new())),
-            pending_clear: Arc::new(Mutex::new(None)),
+            pending_clear: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1053,5 +1056,116 @@ mod tests {
                 .as_deref(),
             Some(MAX_POLL_INTERVAL_SECS.to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn clear_confirm_is_isolated_per_user() {
+        // #42 (analogous to `draft_toggle_is_isolated_per_user`): the two-step
+        // `/clear` gate must be scoped to the user who armed it, so a second
+        // authorized user's `/clear_confirm` can't consume someone else's
+        // pending wipe within the 30s window.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir.path().join("cmd.db"));
+
+        // User A arms a pending /clear.
+        let armed = handle_clear(&ctx, 111);
+        assert!(armed.contains("Опасная операция"), "{armed}");
+
+        // User B's /clear_confirm sees no pending request of their own — it
+        // must NOT consume A's slot.
+        let b = handle_clear_confirm(&ctx, 222).await;
+        assert!(b.contains("Нет ожидающего"), "{b}");
+
+        // A's request survived B's attempt: A can still confirm and wipe.
+        let a = handle_clear_confirm(&ctx, 111).await;
+        assert!(a.contains("Удалено"), "{a}");
+
+        // A's slot is now consumed — a repeat finds nothing to confirm.
+        let a_again = handle_clear_confirm(&ctx, 111).await;
+        assert!(a_again.contains("Нет ожидающего"), "{a_again}");
+    }
+
+    #[tokio::test]
+    async fn clear_confirm_rejects_absent_and_expired_requests() {
+        // #44: window arithmetic in `handle_clear_confirm`. Absent slot and a
+        // slot older than `CLEAR_CONFIRM_WINDOW` are both refused without
+        // wiping.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir.path().join("cmd.db"));
+
+        // Nothing armed yet.
+        let absent = handle_clear_confirm(&ctx, 111).await;
+        assert!(absent.contains("Нет ожидающего"), "{absent}");
+
+        // Arm a stale request by back-dating the timestamp past the window.
+        let stale = Instant::now()
+            .checked_sub(CLEAR_CONFIRM_WINDOW + Duration::from_secs(1))
+            .unwrap();
+        lock_unpoisoned(&ctx.pending_clear).insert(111, stale);
+        let expired = handle_clear_confirm(&ctx, 111).await;
+        assert!(expired.contains("истекло"), "{expired}");
+
+        // Expired confirm still consumes the slot (no auto-armed second wipe).
+        assert!(!lock_unpoisoned(&ctx.pending_clear).contains_key(&111));
+    }
+
+    #[tokio::test]
+    async fn apply_brand_clears_models_only_when_brand_changed() {
+        // #44: brand-change-clears-models invariant. Re-confirming the same
+        // brand must keep the model list; switching brands must wipe it (stale
+        // models produce empty polovni results).
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir.path().join("cmd.db"));
+
+        apply_brand(&ctx, Some("mini".into())).await;
+        apply_models(&ctx, vec!["cooper".into()]).await;
+
+        // Re-confirm the identical brand: models survive.
+        apply_brand(&ctx, Some("mini".into())).await;
+        {
+            let r = ctx.runtime.read().await;
+            assert_eq!(r.search.brand.as_deref(), Some("mini"));
+            assert_eq!(r.search.models, vec!["cooper".to_string()]);
+        }
+
+        // Switch brand: models are cleared in RAM and persisted empty.
+        apply_brand(&ctx, Some("volvo".into())).await;
+        {
+            let r = ctx.runtime.read().await;
+            assert_eq!(r.search.brand.as_deref(), Some("volvo"));
+            assert!(r.search.models.is_empty());
+        }
+        assert_eq!(
+            ctx.storage.get_setting(SETTING_SEARCH_MODELS).unwrap(),
+            Some(String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_brand_failed_persist_leaves_ram_untouched() {
+        // #44: the persist-DB-before-mutating-RAM rule CONTRIBUTING.md names.
+        // We force `set_setting` to fail by dropping the settings table from a
+        // second connection to the same file, then assert RAM is unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cmd.db");
+        let ctx = test_ctx(&db_path);
+
+        apply_brand(&ctx, Some("mini".into())).await;
+        apply_models(&ctx, vec!["cooper".into()]).await;
+
+        // Break the DB out from under Storage: the next INSERT hits a missing
+        // table and `set_setting` returns Err.
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("DROP TABLE runtime_settings", [])
+            .unwrap();
+
+        apply_brand(&ctx, Some("volvo".into())).await;
+
+        // Persist failed on the very first write, so RAM stayed at the old
+        // brand and models — the failure path preserved the invariant.
+        let r = ctx.runtime.read().await;
+        assert_eq!(r.search.brand.as_deref(), Some("mini"));
+        assert_eq!(r.search.models, vec!["cooper".to_string()]);
     }
 }

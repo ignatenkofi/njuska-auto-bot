@@ -112,7 +112,9 @@ async fn main() -> Result<()> {
     // RAM only — there's no persistence story for "user typed /clear 25
     // seconds ago"; if the bot restarts, the pending request is lost (which
     // is correct: a fresh process means a fresh chance to reconsider).
-    let pending_clear = Arc::new(Mutex::new(None));
+    // Keyed by user id (#42): each authorized user arms their own `/clear`
+    // slot, so one user's `/clear_confirm` can't consume another's.
+    let pending_clear = Arc::new(Mutex::new(HashMap::new()));
     // In-flight chassis selections during `/filter → Кузов`, keyed per user
     // id (#9) so concurrent authorized users don't clobber each other's
     // toggles. Absent key = picker not open; entry removed on Save or Back.
