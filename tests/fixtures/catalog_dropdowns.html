@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!--
+  Representative slice of the polovniautomobili.com search form, trimmed to the
+  two <select> dropdowns the dynamic catalog (#11) parses:
+
+    * #brand  — every brand, present on the plain /pretraga page.
+    * #model  — populated for the selected brand on /pretraga?brand=<slug>.
+
+  This is a small hand-authored fixture, NOT a live capture: it exercises the
+  parser (placeholder skipping, whitespace collapsing, value->slug mapping,
+  extra attributes ignored) without hitting the network. If the site's real
+  markup drifts, refresh this and the selectors in src/dyncatalog.rs together.
+-->
+<html lang="sr">
+  <head><meta charset="utf-8"><title>Pretraga</title></head>
+  <body>
+    <form id="search-form" action="/auto-oglasi/pretraga" method="get">
+      <label for="brand">Marka</label>
+      <select name="brand" id="brand" class="form-control">
+        <option value="" selected>Sve marke</option>
+        <option value="audi" data-count="1243">Audi</option>
+        <option value="bmw" data-count="2011">BMW</option>
+        <option value="mercedes-benz" data-count="1876">Mercedes Benz</option>
+        <option value="mini" data-count="87">
+          MINI
+        </option>
+        <option value="volkswagen" data-count="3120">Volkswagen</option>
+      </select>
+
+      <label for="model">Model</label>
+      <select name="model[]" id="model" class="form-control" multiple>
+        <option value="">Svi modeli</option>
+        <option value="a3" data-count="210">A3</option>
+        <option value="a4" data-count="188">A4</option>
+        <option value="a6" data-count="141">A6</option>
+        <option value="q5" data-count="77">Q5</option>
+      </select>
+    </form>
+  </body>
+</html>

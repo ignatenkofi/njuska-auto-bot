@@ -55,7 +55,30 @@ const MIGRATIONS: &[&str] = &[
         value      TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );",
+    // v3: cached brand/model catalog fetched from the site (#11). One flat
+    // table for both kinds keeps the schema tiny:
+    //   * `kind`       — 'brand' or 'model'.
+    //   * `brand_slug` — '' for brand rows; the parent brand for model rows.
+    //   * `item_slug`  — the brand or model slug itself (what we send the site).
+    //   * `display`    — human label for the picker button.
+    //   * `fetched_at` — refresh timestamp, drives the weekly TTL check.
+    // The PK makes a `(kind, brand)` set idempotent to re-fetch, and every
+    // read scopes on `kind` + `brand_slug`, so no index beyond the PK is needed.
+    "CREATE TABLE IF NOT EXISTS catalog (
+        kind        TEXT NOT NULL,
+        brand_slug  TEXT NOT NULL,
+        item_slug   TEXT NOT NULL,
+        display     TEXT NOT NULL,
+        fetched_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (kind, brand_slug, item_slug)
+    );",
 ];
+
+/// `catalog.kind` value for brand rows. Brand rows always carry `brand_slug=''`
+/// (they have no parent); model rows carry their parent brand there.
+const CATALOG_KIND_BRAND: &str = "brand";
+/// `catalog.kind` value for model rows, scoped by their parent `brand_slug`.
+const CATALOG_KIND_MODEL: &str = "model";
 
 /// Wraps a single SQLite [`Connection`].
 ///
@@ -340,6 +363,114 @@ impl Storage {
         debug!("VACUUM completed");
         Ok(())
     }
+
+    // --- Catalog cache (#11) ---
+    //
+    // Both replace_* methods wipe-then-insert the whole `(kind, brand)` set in
+    // one transaction so a reader never sees a half-refreshed catalog, and the
+    // shared `fetched_at` timestamp gives the freshness check a single anchor.
+
+    /// Replaces the cached brand list with `brands` (`(slug, display)` pairs).
+    /// `INSERT OR REPLACE` tolerates a slug the site happens to list twice
+    /// rather than aborting the whole refresh on a PK clash.
+    pub fn replace_catalog_brands(&self, brands: &[(String, String)]) -> Result<()> {
+        self.replace_catalog(CATALOG_KIND_BRAND, "", brands)
+    }
+
+    /// Replaces the cached model list for one brand. `brand_slug` scopes the
+    /// rows so refreshing Audi's models never disturbs BMW's.
+    pub fn replace_catalog_models(
+        &self,
+        brand_slug: &str,
+        models: &[(String, String)],
+    ) -> Result<()> {
+        self.replace_catalog(CATALOG_KIND_MODEL, brand_slug, models)
+    }
+
+    /// Shared wipe-then-insert for one `(kind, brand_slug)` scope.
+    fn replace_catalog(
+        &self,
+        kind: &str,
+        brand_slug: &str,
+        items: &[(String, String)],
+    ) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting catalog replace transaction")?;
+        {
+            tx.execute(
+                "DELETE FROM catalog WHERE kind = ?1 AND brand_slug = ?2",
+                params![kind, brand_slug],
+            )
+            .context("clearing old catalog rows")?;
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO catalog (kind, brand_slug, item_slug, display)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .context("preparing catalog insert")?;
+            for (item_slug, display) in items {
+                stmt.execute(params![kind, brand_slug, item_slug, display])
+                    .with_context(|| format!("inserting catalog item {item_slug}"))?;
+            }
+        }
+        tx.commit().context("committing catalog replace")?;
+        debug!(
+            kind,
+            brand_slug,
+            count = items.len(),
+            "catalog cache replaced"
+        );
+        Ok(())
+    }
+
+    /// Cached brands as `(slug, display)`, in the order the site listed them
+    /// (`rowid` preserves insertion order). Empty when never fetched — the
+    /// caller falls back to the hardcoded catalog.
+    pub fn catalog_brands(&self) -> Result<Vec<(String, String)>> {
+        self.catalog_items(CATALOG_KIND_BRAND, "")
+    }
+
+    /// Cached models for `brand_slug`, same shape and ordering as
+    /// [`catalog_brands`].
+    pub fn catalog_models(&self, brand_slug: &str) -> Result<Vec<(String, String)>> {
+        self.catalog_items(CATALOG_KIND_MODEL, brand_slug)
+    }
+
+    fn catalog_items(&self, kind: &str, brand_slug: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT item_slug, display FROM catalog
+                 WHERE kind = ?1 AND brand_slug = ?2
+                 ORDER BY rowid",
+            )
+            .context("preparing catalog read")?;
+        let rows = stmt
+            .query_map(params![kind, brand_slug], |r| Ok((r.get(0)?, r.get(1)?)))
+            .context("executing catalog read")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collecting catalog rows")
+    }
+
+    /// True when the `(kind, brand_slug)` scope holds at least one row fetched
+    /// within `ttl_days`. Comparing against SQLite's own `datetime('now', …)`
+    /// keeps `fetched_at` (written by `datetime('now')`) in one clock domain,
+    /// exactly like [`prune_seen_older_than`].
+    pub fn catalog_is_fresh(&self, kind: &str, brand_slug: &str, ttl_days: u32) -> Result<bool> {
+        let n: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM catalog
+                 WHERE kind = ?1 AND brand_slug = ?2
+                   AND fetched_at >= datetime('now', ?3)",
+                params![kind, brand_slug, format!("-{ttl_days} days")],
+                |r| r.get(0),
+            )
+            .context("checking catalog freshness")?;
+        Ok(n > 0)
+    }
 }
 
 #[cfg(test)]
@@ -584,5 +715,75 @@ mod tests {
         let u = s.unseen(&[listing(100, "P")]).unwrap();
         assert!(u.is_empty());
         assert_eq!(s.seen_count().unwrap(), 1);
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_owned(), b.to_owned())
+    }
+
+    #[test]
+    fn catalog_brands_round_trip_and_preserve_order() {
+        let (s, _dir) = temp_storage();
+        assert!(s.catalog_brands().unwrap().is_empty(), "empty before fetch");
+
+        let brands = vec![
+            pair("audi", "Audi"),
+            pair("bmw", "BMW"),
+            pair("mini", "MINI"),
+        ];
+        s.replace_catalog_brands(&brands).unwrap();
+        // Insertion order (site order) is preserved via ORDER BY rowid.
+        assert_eq!(s.catalog_brands().unwrap(), brands);
+
+        // Replace wipes the previous set rather than merging it.
+        let fewer = vec![pair("kia", "Kia")];
+        s.replace_catalog_brands(&fewer).unwrap();
+        assert_eq!(s.catalog_brands().unwrap(), fewer);
+    }
+
+    #[test]
+    fn catalog_models_are_scoped_per_brand() {
+        let (s, _dir) = temp_storage();
+        s.replace_catalog_models("audi", &[pair("a3", "A3"), pair("a4", "A4")])
+            .unwrap();
+        s.replace_catalog_models("bmw", &[pair("3", "3 Series")])
+            .unwrap();
+
+        assert_eq!(
+            s.catalog_models("audi").unwrap(),
+            vec![pair("a3", "A3"), pair("a4", "A4")]
+        );
+        assert_eq!(
+            s.catalog_models("bmw").unwrap(),
+            vec![pair("3", "3 Series")]
+        );
+        // A brand we never cached reads back empty, not an error.
+        assert!(s.catalog_models("ford").unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_freshness_flips_after_ttl_window() {
+        let (s, _dir) = temp_storage();
+        // Nothing cached yet -> not fresh.
+        assert!(!s.catalog_is_fresh("brand", "", 7).unwrap());
+
+        s.replace_catalog_brands(&[pair("audi", "Audi")]).unwrap();
+        assert!(
+            s.catalog_is_fresh("brand", "", 7).unwrap(),
+            "just-written is fresh"
+        );
+
+        // Backdate past the weekly window (same trick as the prune test).
+        s.conn()
+            .execute(
+                "UPDATE catalog SET fetched_at = datetime('now', '-8 days')
+                 WHERE kind = 'brand'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !s.catalog_is_fresh("brand", "", 7).unwrap(),
+            "stale past TTL"
+        );
     }
 }

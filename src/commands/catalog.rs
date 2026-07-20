@@ -301,6 +301,20 @@ pub(super) fn models_for_brand(
         .map(|(_, m)| *m)
 }
 
+/// Hardcoded brand list, exposed for `crate::dyncatalog` to return when the
+/// site fetch fails or the cache is empty (#11) — the guaranteed fallback that
+/// keeps the /filter wizard from ever rendering a blank brand picker.
+pub(crate) fn fallback_brands() -> &'static [(&'static str, &'static str)] {
+    BRANDS
+}
+
+/// Hardcoded model list for `brand_slug`, or `None` when we never guessed any
+/// for it. Same fallback role as [`fallback_brands`]; a thin re-export of
+/// [`models_for_brand`] under a name that reads as "fallback" at the call site.
+pub(crate) fn fallback_models(brand_slug: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    models_for_brand(brand_slug)
+}
+
 /// Brand catalog: `(url_slug, display_name)`. The slug is what we pass to the
 /// site as `?brand=...`; the display is what the user sees on a button.
 ///
