@@ -35,9 +35,16 @@ async fn main() -> Result<()> {
     }
 
     // Load .env first so RUST_LOG etc. are visible to tracing_subscriber below.
-    // `.ok()` because a missing .env is fine in environments that inject env vars
-    // directly (containers, systemd unit, CI).
-    let _ = dotenvy::dotenv();
+    // A *missing* .env is fine — containers/systemd/CI inject env vars directly —
+    // so `not_found()` stays silent. But dotenvy stops at the first malformed
+    // line, and every variable below it then silently never loads (#57); that
+    // failure must be loud. tracing isn't up yet (RUST_LOG itself comes from
+    // .env), so we can only reach for `eprintln!` here.
+    if let Err(e) = dotenvy::dotenv()
+        && !e.not_found()
+    {
+        eprintln!("warning: failed to parse .env, some variables may be missing: {e}");
+    }
 
     init_tracing();
 

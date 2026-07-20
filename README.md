@@ -141,19 +141,22 @@ commit still gets tested via `ci.yml`; only tagged commits get a binary.
 
 ### Modules
 
-All `.rs` files live flat under `src/`. Promote to a directory with `mod.rs`
-when something crosses ~300 lines or splits naturally.
+Modules live flat under `src/`; a module is promoted to a directory with
+`mod.rs` when it crosses ~300 lines or splits naturally — `commands/` is the
+one that has (per #24).
 
-| File | Responsibility |
+| Module | Responsibility |
 | --- | --- |
-| `main.rs` | Entry — load env, init tracing, spawn poll + command loops, `tokio::join!` |
+| `main.rs` | Entry — load env, init tracing, spawn poll + command loops, then supervise them via `tokio::select!` |
+| `lib.rs` | Library facade re-exporting the modules so integration tests can link against them |
 | `config.rs` | `StaticConfig` (env-only) + `RuntimeConfig` (env defaults + DB overrides) + `ProxyConfig` |
 | `models.rs` | Shared types — `Listing`, `SearchFilter`, `ShowOldNew` |
 | `scraper.rs` | curl shell-out (optional CF Worker proxy) + HTML parsing via CSS selectors |
 | `storage.rs` | SQLite via `rusqlite` — `seen_listings` (dedup) + `runtime_settings` (user config) |
 | `telegram.rs` | teloxide-based send-only client (`format_listing_html`, `escape_html`) |
-| `commands.rs` | teloxide dispatcher — commands + inline keyboards + callback routing |
+| `commands/` | teloxide dispatcher (directory): `mod.rs` (routing/auth), `catalog.rs` (brands/models/body-type data), `handlers.rs` (per-command handlers + `apply_*` + formatters), `keyboards.rs` (inline keyboards + callback-data constants) |
 | `signals.rs` | SIGINT/SIGTERM handler shared between both loops |
+| `version.rs` | Compile-time `VERSION` string (`CARGO_PKG_VERSION` + git SHA from `build.rs`) |
 | `bot.rs` | The poll loop — fetch / dedup / send + zero-streak detector + dump rotation |
 
 ## Getting started
@@ -235,7 +238,7 @@ The split:
 
 ```bash
 cargo build
-cargo test                                  # 37 unit + integration tests
+cargo test                                  # 105 unit + 7 integration tests
 cargo clippy --all-targets -- -D warnings   # must be clean
 cargo fmt
 RUST_LOG=njuska_auto_bot=debug cargo run    # verbose logs while developing
@@ -282,9 +285,9 @@ A few decisions worth knowing about, in case you read the source:
 ## Contributing
 
 PRs welcome. The bot is intentionally minimal — if you want to add a new
-filter section, follow the pattern of an existing one in `commands.rs`
-(brand picker for single-select, chassis picker for multi-select, range
-picker for from/to ranges).
+filter section, follow the pattern of an existing one in the `commands/`
+module (brand picker for single-select, chassis picker for multi-select, range
+picker for from/to ranges). See `CONTRIBUTING.md` for the step-by-step.
 
 If polovniautomobili.com changes its HTML structure and the parser breaks,
 the bot sends a "0 listings N times in a row" alert. The HTML dumps in

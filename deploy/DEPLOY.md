@@ -31,14 +31,18 @@ sudo apt update
 sudo apt install -y curl git
 ```
 
-That's the entire runtime dependency list. The bot binary itself is
-statically-linked against rusqlite (bundled SQLite) and rustls (no system
-OpenSSL), so the only thing it needs from the OS is `curl` (for fetching)
-and libc.
+That's almost the entire runtime dependency list. The bot binary statically
+links rusqlite (bundled SQLite), so there's no `libsqlite3` to install. Its
+Telegram HTTP stack, however, comes from teloxide → reqwest with the default
+`native-tls` backend, so the binary *does* dynamically link the system's
+`libssl`/`libcrypto` (OpenSSL). Debian 12's base install already ships
+`libssl3` — `apt` itself depends on it — so there's nothing extra to install,
+but `ldd` will show OpenSSL alongside libc, not libc alone. Beyond that the
+bot needs only `curl` (for fetching polovni).
 
 > **No Rust toolchain on the VM.** We build the binary on GitHub Actions
-> and the VM just downloads it from the `nightly` release. Saves a few GB of
-> disk and a few minutes per upgrade.
+> and the VM just downloads it from the latest tagged release. Saves a few GB
+> of disk and a few minutes per upgrade.
 
 ## Step 3 — Create a dedicated user
 

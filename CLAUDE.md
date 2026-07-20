@@ -61,16 +61,20 @@ These were agreed at project start — don't quietly drop them in a refactor:
 
 ## Project layout
 
-Flat modules under `src/`:
+Modules under `src/` (promote a module to a directory with `mod.rs` when it
+exceeds ~300 lines or splits naturally — `commands/` already has, per #24):
 
-- `main.rs` — entry, tracing init, poll loop.
-- `config.rs` — env -> typed `Config`.
-- `models.rs` — `Listing`, `SearchFilter`, shared types.
-- `scraper.rs` — fetch + parse.
-- `storage.rs` — SQLite via `rusqlite`.
-- `telegram.rs` — send-only Bot API client.
-
-Promote a module to a directory with `mod.rs` only when it exceeds ~300 lines or splits naturally into submodules.
+- `main.rs` — entry: load env, init tracing, spawn the poll loop + command listener, then supervise them (`tokio::select!`, restart-on-death).
+- `lib.rs` — library facade re-exporting the modules so integration tests can link against them.
+- `bot.rs` — the poll loop: fetch → dump → parse → dedup → send, plus the zero-results streak detector and dump rotation.
+- `config.rs` — env -> `StaticConfig` (fixed) + `RuntimeConfig` (env defaults merged with DB overrides) + `ProxyConfig`.
+- `models.rs` — `Listing`, `SearchFilter`, `ShowOldNew`, shared types.
+- `scraper.rs` — curl shell-out (optional CF Worker proxy) + HTML parse via CSS selectors.
+- `storage.rs` — SQLite via `rusqlite` (`seen_listings` dedup + `runtime_settings`).
+- `telegram.rs` — teloxide-based send-only client + HTML escaping.
+- `commands/` — teloxide command dispatcher: `mod.rs` (routing/auth, `Command`, `CommandContext`), `catalog.rs` (brand/model/body-type data), `handlers.rs` (per-command handlers + `apply_*` + formatters), `keyboards.rs` (inline keyboards + callback-data constants).
+- `signals.rs` — shared SIGINT/SIGTERM future + internal `request_shutdown` path.
+- `version.rs` — compile-time `VERSION` string (`CARGO_PKG_VERSION` + git SHA from `build.rs`).
 
 ## Useful commands
 
