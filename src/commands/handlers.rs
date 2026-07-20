@@ -200,7 +200,11 @@ pub(super) async fn handle_dump(ctx: &CommandContext, n: u32) -> String {
     if listings.is_empty() {
         return "📋 База пустая — пока ничего не было сохранено.".into();
     }
-    format_dump_message(&listings, n)
+    // Pass the *post-cap* `limit`, not the raw `n` (#45). The header decides
+    // "showing all rows" by comparing `listings.len()` against this value; with
+    // the raw `n`, a `/dump 100` against a >25-row store made 25 < 100 true and
+    // falsely printed "Все 25 объявлений в БД" — the MAX cap, not the DB size.
+    format_dump_message(&listings, limit)
 }
 
 /// Pure formatter behind `/dump` — separated from the handler so the
@@ -212,7 +216,12 @@ pub(super) async fn handle_dump(ctx: &CommandContext, n: u32) -> String {
 /// titles are hard-truncated, and lines stop (with a "… ещё N" note) once
 /// the running total approaches the limit — 25 normal listings fit, 25
 /// pathological ones degrade gracefully instead of triggering a 400.
-fn format_dump_message(listings: &[crate::models::Listing], requested: u32) -> String {
+///
+/// `limit` is the **post-cap** row budget the caller asked storage for (`MAX`
+/// at most), not the user's raw `/dump N`. The "showing all rows" header only
+/// fires when the store returned *fewer* rows than that budget — otherwise a
+/// `/dump 100` truncated by the cap would falsely claim the DB holds 25 (#45).
+fn format_dump_message(listings: &[crate::models::Listing], limit: u32) -> String {
     /// Telegram's hard cap on message length, in characters.
     const TG_MESSAGE_LIMIT: usize = 4096;
     /// Slack reserved for the "… ещё N" tail note.
@@ -220,11 +229,11 @@ fn format_dump_message(listings: &[crate::models::Listing], requested: u32) -> S
     /// Titles longer than this (pre-escaping) get an ellipsis.
     const MAX_TITLE_CHARS: usize = 120;
 
-    let header = if listings.len() < requested as usize {
+    let header = if listings.len() < limit as usize {
         format!(
             "📋 Все <b>{}</b> объявлений в БД (запрошено {}):",
             listings.len(),
-            requested
+            limit
         )
     } else {
         format!(
@@ -976,6 +985,40 @@ mod tests {
         let msg = format_dump_message(&listings, 1);
         assert!(msg.contains('\u{202E}'), "{msg}");
         assert!(msg.contains('\u{200B}'), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn dump_over_cap_with_large_store_does_not_claim_all_rows() {
+        // #45: >25 stored and `/dump 100`. The 25-item cap truncates, but the
+        // header must NOT print "Все 25 … в БД" — that count is the cap, not the
+        // DB size. handle_dump has to pass the post-cap limit to the formatter.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir.path().join("cmd.db"));
+
+        let stored: Vec<_> = (1..=30)
+            .map(|i| {
+                dump_listing(
+                    i,
+                    &format!("Car {i}"),
+                    &format!("https://example.com/auto-oglasi/{i}/car"),
+                )
+            })
+            .collect();
+        ctx.storage.mark_seen(&stored).unwrap();
+
+        let msg = handle_dump(&ctx, 100).await;
+        assert!(
+            !msg.contains("Все"),
+            "must not claim the DB holds only 25: {msg}"
+        );
+        assert!(msg.contains("Последние"), "{msg}");
+
+        // A store genuinely smaller than the request still says "Все".
+        let dir2 = tempfile::tempdir().unwrap();
+        let ctx2 = test_ctx(&dir2.path().join("cmd.db"));
+        ctx2.storage.mark_seen(&stored[..3]).unwrap();
+        let small = handle_dump(&ctx2, 100).await;
+        assert!(small.contains("Все <b>3</b>"), "{small}");
     }
 
     /// A real `CommandContext` over a temp SQLite file (never the real DB),

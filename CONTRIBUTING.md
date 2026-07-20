@@ -59,29 +59,35 @@ together. Keep new code in the library side.
 
 ## Adding a filter section to `/filter`
 
-Follow the pattern of an existing section in `src/commands.rs` — pick the
-closest shape:
+Follow the pattern of an existing section in the `src/commands/` module —
+pick the closest shape:
 
 - **single-select** → brand picker (`CB_FILTER_BRAND_*`)
 - **multi-select** → chassis picker (`CB_FILTER_CHASSIS_*`, draft slot in
   `CommandContext`)
 - **from/to range** → the shared range picker (`CB_FILTER_RANGE_SET_PREFIX`)
 
+`commands/` is split (per #24): pure catalog data in `catalog.rs`, inline
+keyboards + callback-data constants in `keyboards.rs`, per-command handlers /
+`apply_*` / formatters in `handlers.rs`, and routing (`handle_command`,
+`handle_callback`) + `Command`/`CommandContext` in `mod.rs`.
+
 The steps are always the same:
 
-1. Catalog constant (`const FOO: &[…]`) near the top of `commands.rs`.
-2. Callback-data constants in the `f:` namespace (Telegram caps callback
-   data at 64 bytes — keep them short).
-3. Keyboard builder fn + branch(es) in `handle_callback`.
-4. An `apply_foo()` that **persists to `runtime_settings` first, then
-   mutates `RuntimeConfig`, then calls `runtime_changed.notify_one()`** —
-   persist-first is the invariant that keeps RAM and DB consistent on a
-   failed write.
+1. Catalog constant (`const FOO: &[…]`) in `commands/catalog.rs`.
+2. Callback-data constants in the `f:` namespace, in `commands/keyboards.rs`
+   (Telegram caps callback data at 64 bytes — keep them short).
+3. Keyboard builder fn in `commands/keyboards.rs` + branch(es) in
+   `handle_callback` (`commands/mod.rs`).
+4. An `apply_foo()` in `commands/handlers.rs` that **persists to
+   `runtime_settings` first, then mutates `RuntimeConfig`, then calls
+   `runtime_changed.notify_one()`** — persist-first is the invariant that
+   keeps RAM and DB consistent on a failed write.
 5. A `SETTING_…` key in `config.rs` plus the three-state merge in
    `RuntimeConfig::load` (absent key = env default, empty = explicitly
    cleared, value = user's choice).
-6. Render the field in `format_filter_ru`, escape anything user-supplied
-   with `telegram::escape_html`.
+6. Render the field in `format_filter_ru` (`commands/handlers.rs`), escape
+   anything user-supplied with `telegram::escape_html`.
 7. Add `.env` fallback support in `config.rs` and document it in
    `.env.example`.
 

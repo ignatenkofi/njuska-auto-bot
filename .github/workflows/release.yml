@@ -64,7 +64,10 @@ jobs:
         run: strip target/release/njuska_auto_bot
 
       - name: Show binary info
-        # Sanity in CI logs: dynamic deps should be tiny (just libc).
+        # Sanity in CI logs: SQLite is bundled (static), but teloxide's default
+        # native-tls backend dynamically links the system libssl/libcrypto
+        # (OpenSSL), present on the Debian 12 target — so `ldd` shows libc *and*
+        # OpenSSL, not libc alone (see deploy/DEPLOY.md, #55).
         run: |
           ls -la target/release/njuska_auto_bot
           file target/release/njuska_auto_bot
