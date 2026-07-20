@@ -171,14 +171,16 @@ pub struct CommandContext {
     /// In-flight gearbox selections (#7). Same shape and lifecycle as
     /// `chassis_draft` — numeric codes, per-user, discarded on Back.
     pub gearbox_draft: Arc<Mutex<HashMap<i64, Vec<u32>>>>,
-    /// Timestamp of the most recent `/clear` that's still awaiting confirmation.
-    /// `None` means no pending request. `Some(t)` is valid for
-    /// `CLEAR_CONFIRM_WINDOW` after `t`; afterwards the next `/clear_confirm`
-    /// treats it as stale.
+    /// Timestamp of each authorized user's most recent `/clear` still awaiting
+    /// confirmation, keyed by the sender's user id (#42). Absent key = that
+    /// user has no pending request; a present `Instant` is valid for
+    /// `CLEAR_CONFIRM_WINDOW` after it, afterwards the next `/clear_confirm`
+    /// treats it as stale. Keying per-user (like the draft maps) stops user
+    /// B's `/clear_confirm` from consuming user A's pending `/clear`.
     ///
     /// Plain `std::sync::Mutex` (not `tokio::sync::Mutex`) — we never hold
     /// it across `.await`, and ops are nanoseconds.
-    pub pending_clear: Arc<Mutex<Option<Instant>>>,
+    pub pending_clear: Arc<Mutex<HashMap<i64, Instant>>>,
 }
 
 /// Run the command listener until shutdown signal.
@@ -281,6 +283,12 @@ async fn handle_command(
     // this, read-only commands (/start, /status, /help) leave no log trail at all.
     info!(?cmd, user_id = ?user_id, "command received");
 
+    // `authorized` above guarantees `user_id` is `Some`; bind the id for the
+    // per-user `/clear` gate (#42). `unwrap_or_default` keeps us off the
+    // banned `unwrap`/`expect` while the `is_some_and` check makes the default
+    // branch unreachable.
+    let sender_id = user_id.unwrap_or_default();
+
     let reply: String = match cmd {
         Command::Start => format_start(),
         Command::Help => Command::descriptions().to_string(),
@@ -288,8 +296,8 @@ async fn handle_command(
         Command::Pause => handle_pause(&ctx).await,
         Command::Resume => handle_resume(&ctx).await,
         Command::Interval(secs) => handle_interval(&ctx, secs).await,
-        Command::Clear => handle_clear(&ctx),
-        Command::ClearConfirm => handle_clear_confirm(&ctx).await,
+        Command::Clear => handle_clear(&ctx, sender_id),
+        Command::ClearConfirm => handle_clear_confirm(&ctx, sender_id).await,
         Command::Filter => {
             // /filter has a different reply shape than the rest — it sends a
             // message with an inline keyboard. We do that directly here

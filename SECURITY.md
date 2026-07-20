@@ -44,8 +44,13 @@ person in their spare time. Realistically:
 
 Things that are *known and accepted* trade-offs, not vulnerabilities:
 
-- The bot trusts its single configured operator (`AUTHORIZED_USER_ID`);
-  there is no multi-user permission model.
+- `AUTHORIZED_USER_ID` may hold one id or a comma-separated list, and every
+  listed id is an equally-trusted peer: there are no per-user permission
+  distinctions — anyone on the list can run any command and see any other
+  user's state. (The `/clear` confirmation gate is scoped per-user as of #42,
+  so one operator's `/clear_confirm` no longer consumes another's pending
+  `/clear`; that is an accident-avoidance fix, not a trust boundary between
+  authorized operators.)
 - HTML fetched from polovniautomobili.com is treated as untrusted input;
   escaping bugs in what the bot forwards to Telegram **are** in scope.
 - Secrets live in `.env` / systemd environment on the deployment box —
