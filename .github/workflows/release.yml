@@ -39,7 +39,7 @@ jobs:
     name: Test & build ${{ inputs.tag || github.ref_name }}
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # When invoked via workflow_dispatch, check out the specified tag
           # rather than HEAD of the default branch.
@@ -71,7 +71,7 @@ jobs:
           ldd target/release/njuska_auto_bot || true
 
       - name: Upload binary for downstream jobs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: njuska_auto_bot
           path: target/release/njuska_auto_bot
@@ -89,7 +89,7 @@ jobs:
     container: debian:12
     steps:
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: njuska_auto_bot
 
@@ -111,12 +111,12 @@ jobs:
       contents: write # needed for `gh release create`
     steps:
       # gh needs a repo checkout to infer the origin repo.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: njuska_auto_bot
 
