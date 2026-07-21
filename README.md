@@ -53,8 +53,8 @@ the moment they appear.
 | `/status` | Current config, paused state, DB row count |
 | `/pause` `/resume` | Toggle the poll loop |
 | `/interval N` | Set polling interval in seconds (≥ 60) |
-| `/filter` | **The main UI** — inline menu for brand / models / body / price / year / interval, with single-tap presets and multi-select toggles |
-| `/setbrand <slug>` | Set a brand not in the hardcoded catalog (e.g. `/setbrand alfa-romeo`) |
+| `/filter` | **The main UI** — inline menu for brand / models / body / price / year / interval, with single-tap presets and multi-select toggles. Brand and model lists are fetched from the site (cached weekly, paginated) and fall back to a hardcoded catalog if the fetch fails |
+| `/setbrand <slug>` | Fallback manual brand entry (e.g. `/setbrand alfa-romeo`) — rarely needed now that the picker lists the full site catalog; useful if the fetch failed or the brand is somehow absent |
 | `/clear` + `/clear_confirm` | Wipe the seen-listings dedup table |
 | `/dump N` | Show the last N saved listings as a compact list |
 | `/cancel` | Informational — there's nothing to cancel, this is the answer |

@@ -17,8 +17,11 @@
 //! * **resolve** — storage-backed: refresh-if-stale, then read the cache, then
 //!   fall back to the hardcoded catalog on any gap.
 //!
-//! Wiring the `/filter` wizard to call [`brands`] / [`models`] (plus keyboard
-//! pagination for long model lists) is a deliberate follow-up — Refs #11.
+//! The `/filter` wizard's brand and model pickers call [`brands_or_fallback`] /
+//! [`models_or_fallback`] to render instantly, and fire [`refresh_brands_if_stale`]
+//! / [`refresh_models_if_stale`] in the background so a tap never waits on the
+//! network. Both pickers paginate (site catalogs run long) — see
+//! `crate::commands::keyboards`.
 
 use std::sync::LazyLock;
 
