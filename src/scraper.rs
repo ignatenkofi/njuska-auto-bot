@@ -151,25 +151,38 @@ pub async fn fetch_search(
     proxy: Option<&ProxyConfig>,
     page: u32,
 ) -> Result<String, ScraperError> {
-    let original_url = filter.to_url_for_page(page);
+    let target = filter.to_url_for_page(page);
+    debug!(
+        page,
+        via_proxy = proxy.is_some(),
+        "fetching search page via curl"
+    );
+    fetch_url(&target, proxy).await
+}
+
+/// Fetches an arbitrary polovniautomobili.com URL through the **same** curl +
+/// optional CF-Worker-proxy path [`fetch_search`] uses, returning the raw body.
+///
+/// `target` is the real site URL; when `proxy` is `Some`, host+scheme are
+/// swapped for the Worker's while path+query are forwarded verbatim (the Worker
+/// re-origins the request from Cloudflare's own network, dodging the Managed
+/// Challenge). Factored out of `fetch_search` so the dynamic brand/model
+/// catalog refresh (#11) rides this exact path instead of duplicating the curl
+/// invocation and its secret-on-stdin handling.
+pub async fn fetch_url(target: &Url, proxy: Option<&ProxyConfig>) -> Result<String, ScraperError> {
     // When a proxy is configured, swap host+scheme with the Worker's URL but
     // keep path + query intact — that's what the Worker forwards verbatim.
     let request_url = match proxy {
         Some(p) => {
             let mut u = p.url.clone();
-            u.set_path(original_url.path());
-            u.set_query(original_url.query());
+            u.set_path(target.path());
+            u.set_query(target.query());
             u
         }
-        None => original_url,
+        None => target.clone(),
     };
 
-    debug!(
-        url = %request_url,
-        page,
-        via_proxy = proxy.is_some(),
-        "fetching search page via curl"
-    );
+    debug!(url = %request_url, via_proxy = proxy.is_some(), "curl GET");
 
     let mut cmd = Command::new("curl");
     cmd.arg("--http1.1")

@@ -9,6 +9,7 @@
 pub mod bot;
 pub mod commands;
 pub mod config;
+pub mod dyncatalog;
 pub mod models;
 pub mod scraper;
 pub mod signals;

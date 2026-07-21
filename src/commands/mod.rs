@@ -22,7 +22,7 @@
 //! in the operator log). A "you're not authorized" reply would leak the
 //! existence of the bot to bystanders.
 
-mod catalog;
+pub(crate) mod catalog;
 mod handlers;
 mod keyboards;
 
