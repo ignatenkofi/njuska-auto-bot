@@ -43,7 +43,9 @@ use crate::config::{MIN_POLL_INTERVAL_SECS, RuntimeConfig, StaticConfig};
 use crate::signals::shutdown_signal;
 use crate::storage::Storage;
 
-use catalog::{PRICE_RANGES, YEAR_RANGES, models_for_brand};
+use crate::dyncatalog;
+
+use catalog::{PRICE_RANGES, YEAR_RANGES};
 use handlers::{
     apply_brand, apply_chassis, apply_gearbox, apply_interval, apply_models, apply_price_range,
     apply_reset_all, apply_year_range, format_cancel, format_filter_menu_body, format_filter_ru,
@@ -52,15 +54,17 @@ use handlers::{
     models_picker_title,
 };
 use keyboards::{
-    CB_FILTER_BRAND_CLEAR, CB_FILTER_BRAND_CUSTOM_HINT, CB_FILTER_BRAND_PICKER,
-    CB_FILTER_BRAND_SET_PREFIX, CB_FILTER_CHASSIS_PICKER, CB_FILTER_CHASSIS_SAVE,
-    CB_FILTER_CHASSIS_TOGGLE_PREFIX, CB_FILTER_DONE, CB_FILTER_GEARBOX_PICKER,
-    CB_FILTER_GEARBOX_SAVE, CB_FILTER_GEARBOX_TOGGLE_PREFIX, CB_FILTER_INTERVAL_PICKER,
-    CB_FILTER_INTERVAL_SET_PREFIX, CB_FILTER_MENU, CB_FILTER_MODELS_PICKER, CB_FILTER_MODELS_SAVE,
-    CB_FILTER_MODELS_TOGGLE_PREFIX, CB_FILTER_PRICE_PICKER, CB_FILTER_RANGE_SET_PREFIX,
-    CB_FILTER_RESET_APPLY, CB_FILTER_RESET_CONFIRM, CB_FILTER_TODO, CB_FILTER_YEAR_PICKER,
-    brand_picker_keyboard, chassis_picker_keyboard, filter_menu_keyboard, gearbox_picker_keyboard,
-    interval_picker_keyboard, model_picker_keyboard, range_picker_keyboard, reset_confirm_keyboard,
+    CB_FILTER_BRAND_CLEAR, CB_FILTER_BRAND_CUSTOM_HINT, CB_FILTER_BRAND_PAGE_PREFIX,
+    CB_FILTER_BRAND_PICKER, CB_FILTER_BRAND_SET_PREFIX, CB_FILTER_CHASSIS_PICKER,
+    CB_FILTER_CHASSIS_SAVE, CB_FILTER_CHASSIS_TOGGLE_PREFIX, CB_FILTER_DONE,
+    CB_FILTER_GEARBOX_PICKER, CB_FILTER_GEARBOX_SAVE, CB_FILTER_GEARBOX_TOGGLE_PREFIX,
+    CB_FILTER_INTERVAL_PICKER, CB_FILTER_INTERVAL_SET_PREFIX, CB_FILTER_MENU,
+    CB_FILTER_MODELS_PAGE_PREFIX, CB_FILTER_MODELS_PICKER, CB_FILTER_MODELS_SAVE,
+    CB_FILTER_MODELS_TOGGLE_PREFIX, CB_FILTER_NOOP, CB_FILTER_PRICE_PICKER,
+    CB_FILTER_RANGE_SET_PREFIX, CB_FILTER_RESET_APPLY, CB_FILTER_RESET_CONFIRM, CB_FILTER_TODO,
+    CB_FILTER_YEAR_PICKER, brand_picker_keyboard, chassis_picker_keyboard, filter_menu_keyboard,
+    gearbox_picker_keyboard, interval_picker_keyboard, model_picker_keyboard,
+    range_picker_keyboard, reset_confirm_keyboard,
 };
 
 /// Commands the bot understands.
@@ -103,7 +107,10 @@ pub enum Command {
     ClearConfirm,
     #[command(description = "Настроить фильтры поиска через диалог.")]
     Filter,
-    #[command(description = "Установить марку вручную (slug). Пример: /setbrand smart")]
+    #[command(
+        description = "Запасной ручной ввод марки (slug) — на случай, если каталог с сайта \
+                       не подтянулся. Обычно проще выбрать в ✏️ Марка. Пример: /setbrand smart"
+    )]
     SetBrand(String),
     #[command(description = "Показать последние N сохранённых объявлений (1-25). Пример: /dump 10")]
     Dump(u32),
@@ -393,6 +400,38 @@ fn toggle_in_draft<T: PartialEq + Clone>(
     v.clone()
 }
 
+/// Kicks off a background refresh of the brand catalog when the cache is stale
+/// (#11), then returns immediately. The picker always renders from whatever the
+/// cache — or the hardcoded fallback — already holds, so a tap never waits on
+/// the network: `crate::scraper::fetch_url` is capped at 30s, and blocking the
+/// callback on it would freeze the wizard. Freshly fetched data lands in the
+/// cache for the *next* open. This mirrors the poll loop's "never block the
+/// user path on the network" stance; `/diag` stays the one place a fetch is
+/// awaited inline, because there waiting is the point.
+///
+/// `tokio::spawn` needs an owned, `'static`, `Send` future, so we clone the two
+/// `Arc`s (cheap — refcount bumps, not deep copies) and move them in. The
+/// returned `JoinHandle` is dropped: fire-and-forget, and any failure is logged
+/// inside `refresh_*_if_stale` rather than surfaced here.
+fn spawn_brand_refresh(ctx: &CommandContext) {
+    let storage = Arc::clone(&ctx.storage);
+    let static_cfg = Arc::clone(&ctx.static_cfg);
+    tokio::spawn(async move {
+        dyncatalog::refresh_brands_if_stale(&storage, static_cfg.cf_proxy.as_ref()).await;
+    });
+}
+
+/// Per-brand analogue of [`spawn_brand_refresh`]. `brand_slug` is copied into
+/// the task (it borrows the caller's runtime read otherwise).
+fn spawn_model_refresh(ctx: &CommandContext, brand_slug: &str) {
+    let storage = Arc::clone(&ctx.storage);
+    let static_cfg = Arc::clone(&ctx.static_cfg);
+    let brand = brand_slug.to_owned();
+    tokio::spawn(async move {
+        dyncatalog::refresh_models_if_stale(&storage, static_cfg.cf_proxy.as_ref(), &brand).await;
+    });
+}
+
 /// Single endpoint for every inline-keyboard tap. We dispatch on the
 /// `callback_data` string.
 ///
@@ -432,6 +471,9 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
     let message_id = orig.id();
 
     let (text, markup): (String, Option<InlineKeyboardMarkup>) = match data {
+        // Inert page-indicator button in a paginated picker — the spinner was
+        // already answered above; nothing to redraw.
+        CB_FILTER_NOOP => return Ok(()),
         CB_FILTER_MENU => {
             // Returning to the menu always discards any in-flight picker
             // edits — "back without saving" semantics.
@@ -451,19 +493,41 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // picker (#6) — the latter leaves an unsaved models draft
             // behind, so this navigation discards too.
             discard_drafts(&ctx, user_id);
-            ("Выбери марку:".to_string(), Some(brand_picker_keyboard()))
+            spawn_brand_refresh(&ctx);
+            let brands = dyncatalog::brands_or_fallback(&ctx.storage);
+            (
+                "Выбери марку:".to_string(),
+                Some(brand_picker_keyboard(&brands, 0)),
+            )
         }
-        CB_FILTER_BRAND_CUSTOM_HINT => (
-            "💬 <b>Бренд вне каталога?</b>\n\n\
-             Отправь команду <code>/setbrand &lt;slug&gt;</code>\n\
-             Slug — это значение из URL сайта polovniautomobili.com, \
-             в параметре <code>brand=</code>.\n\n\
-             Примеры: <code>/setbrand smart</code>, <code>/setbrand suzuki</code>, \
-             <code>/setbrand alfa-romeo</code>.\n\n\
-             Если потом захочешь обратно в каталог — открой ✏️ Марка."
-                .into(),
-            Some(brand_picker_keyboard()),
-        ),
+        s if s.starts_with(CB_FILTER_BRAND_PAGE_PREFIX) => {
+            // Page nav in the brand picker — the dynamic catalog can span
+            // several pages (#11). No draft to touch; just re-render the page.
+            let page = s[CB_FILTER_BRAND_PAGE_PREFIX.len()..]
+                .parse::<usize>()
+                .unwrap_or(0);
+            let brands = dyncatalog::brands_or_fallback(&ctx.storage);
+            (
+                "Выбери марку:".to_string(),
+                Some(brand_picker_keyboard(&brands, page)),
+            )
+        }
+        CB_FILTER_BRAND_CUSTOM_HINT => {
+            let brands = dyncatalog::brands_or_fallback(&ctx.storage);
+            (
+                "💬 <b>Бренд вне каталога?</b>\n\n\
+                 Обычно это не нужно — список марок теперь подтягивается с сайта \
+                 целиком. Но если фетч не удался или марки всё равно нет, \
+                 отправь <code>/setbrand &lt;slug&gt;</code>.\n\
+                 Slug — значение из URL polovniautomobili.com в параметре \
+                 <code>brand=</code>.\n\n\
+                 Примеры: <code>/setbrand smart</code>, <code>/setbrand suzuki</code>, \
+                 <code>/setbrand alfa-romeo</code>.\n\n\
+                 Если потом захочешь обратно в каталог — открой ✏️ Марка."
+                    .into(),
+                Some(brand_picker_keyboard(&brands, 0)),
+            )
+        }
         CB_FILTER_BRAND_CLEAR => {
             apply_brand(&ctx, None).await;
             let (search, interval_secs) = {
@@ -679,29 +743,62 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 // brand picker right here (#6). Picking a brand lands on the
                 // menu, from where models is one tap — and the picker's own
                 // back row keeps the menu reachable.
-                None => (
-                    "❌ Сначала выбери марку — без неё список моделей не известен:".into(),
-                    Some(brand_picker_keyboard()),
-                ),
-                Some(brand_slug) => match models_for_brand(&brand_slug) {
-                    Some(model_list) => {
+                None => {
+                    let brands = dyncatalog::brands_or_fallback(&ctx.storage);
+                    (
+                        "❌ Сначала выбери марку — без неё список моделей не известен:".into(),
+                        Some(brand_picker_keyboard(&brands, 0)),
+                    )
+                }
+                Some(brand_slug) => {
+                    // Freshen this brand's models in the background; render now
+                    // from the cache/fallback (#11). Empty = brand the site and
+                    // the hardcoded catalog both have no models for.
+                    spawn_model_refresh(&ctx, &brand_slug);
+                    let model_list = dyncatalog::models_or_fallback(&ctx.storage, &brand_slug);
+                    if model_list.is_empty() {
+                        (
+                            format!(
+                                "🤷 Для марки <code>{}</code> у меня нет каталога моделей.\n\n\
+                                 Поставь модели через <code>SEARCH_MODEL</code> в \
+                                 <code>.env</code>, либо смени марку через ✏️ Марка.",
+                                crate::telegram::escape_html(&brand_slug)
+                            ),
+                            Some(filter_menu_keyboard()),
+                        )
+                    } else {
                         lock_unpoisoned(&ctx.models_draft).insert(user_id, initial_models.clone());
                         (
                             models_picker_title(&brand_slug),
-                            Some(model_picker_keyboard(model_list, &initial_models)),
+                            Some(model_picker_keyboard(&model_list, &initial_models, 0)),
                         )
                     }
-                    None => (
-                        format!(
-                            "🤷 Для марки <code>{}</code> у меня нет каталога моделей.\n\n\
-                             Поставь модели через <code>SEARCH_MODEL</code> в <code>.env</code>, \
-                             либо смени марку через ✏️ Марка.",
-                            crate::telegram::escape_html(&brand_slug)
-                        ),
-                        Some(filter_menu_keyboard()),
-                    ),
-                },
+                }
             }
+        }
+        s if s.starts_with(CB_FILTER_MODELS_PAGE_PREFIX) => {
+            // Page nav in the model picker (#11). Keep the in-flight draft —
+            // toggles made on other pages must survive paging — and re-render
+            // the requested page with the draft's current selection.
+            let page = s[CB_FILTER_MODELS_PAGE_PREFIX.len()..]
+                .parse::<usize>()
+                .unwrap_or(0);
+            let brand = ctx.runtime.read().await.search.brand.clone();
+            let Some(brand_slug) = brand else {
+                return Ok(());
+            };
+            let model_list = dyncatalog::models_or_fallback(&ctx.storage, &brand_slug);
+            if model_list.is_empty() {
+                return Ok(());
+            }
+            let selected = lock_unpoisoned(&ctx.models_draft)
+                .get(&user_id)
+                .cloned()
+                .unwrap_or_default();
+            (
+                models_picker_title(&brand_slug),
+                Some(model_picker_keyboard(&model_list, &selected, page)),
+            )
         }
         CB_FILTER_MODELS_SAVE => {
             let draft = lock_unpoisoned(&ctx.models_draft)
@@ -718,10 +815,17 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             )
         }
         s if s.starts_with(CB_FILTER_MODELS_TOGGLE_PREFIX) => {
-            let slug = &s[CB_FILTER_MODELS_TOGGLE_PREFIX.len()..];
+            // Data is `<page>:<slug>` — the page rides along so the redraw
+            // after a toggle stays on the page the user is looking at (#11).
+            let tail = &s[CB_FILTER_MODELS_TOGGLE_PREFIX.len()..];
+            let Some((page_str, slug)) = tail.split_once(':') else {
+                warn!(unknown = s, "models toggle without page:slug");
+                return Ok(());
+            };
             if slug.is_empty() {
                 return Ok(());
             }
+            let page = page_str.parse::<usize>().unwrap_or(0);
             // Need the brand to know which keyboard layout to redraw.
             let brand = ctx.runtime.read().await.search.brand.clone();
             let Some(brand_slug) = brand else {
@@ -729,13 +833,14 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 // but defend gracefully.
                 return Ok(());
             };
-            let Some(model_list) = models_for_brand(&brand_slug) else {
+            let model_list = dyncatalog::models_or_fallback(&ctx.storage, &brand_slug);
+            if model_list.is_empty() {
                 return Ok(());
-            };
+            }
             let new_state = toggle_in_draft(&ctx.models_draft, user_id, slug.to_owned());
             (
                 models_picker_title(&brand_slug),
-                Some(model_picker_keyboard(model_list, &new_state)),
+                Some(model_picker_keyboard(&model_list, &new_state, page)),
             )
         }
         s if s.starts_with(CB_FILTER_CHASSIS_TOGGLE_PREFIX) => {
