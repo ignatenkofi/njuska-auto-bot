@@ -111,6 +111,7 @@ fn test_runtime() -> Arc<RwLock<RuntimeConfig>> {
         search: SearchFilter::default(),
         poll_interval: Duration::from_secs(600),
         paused: false,
+        lang: njuska_auto_bot::i18n::Lang::Ru,
     }))
 }
 

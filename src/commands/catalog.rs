@@ -5,71 +5,52 @@
 //! so growing the catalogs (the most common edit) never touches handler
 //! logic.
 
-/// Body-type catalog: `(numeric_code, display_name)`. Codes are the ones the
-/// site uses internally in `chassis[]=...`. Display names are in Russian
-/// (Cyrillic) for friendlier UI; the original Serbian names (Kabriolet,
-/// Limuzina, …) read close enough but the Russian spellings feel more native.
+/// Body-type codes offered in the chassis picker, in display order. The codes
+/// are what the site expects in `chassis[]=...`; their localized labels live in
+/// [`crate::i18n::Lang::chassis_label`] (#33 moved display text out of the
+/// catalog once it became language-aware).
 ///
-/// Subset of what polovni offers — these are the 6 a personal-shopper would
-/// realistically tick. If you need a more exotic body type (Minivan, Pickup),
-/// fall back to `SEARCH_CHASSIS` in `.env`.
-pub(super) const CHASSIS: &[(u32, &str)] = &[
-    (2627, "Универсал"),
-    (2628, "Купе"),
-    (2629, "Хэтчбек"),
-    (2631, "Седан"),
-    (2632, "Внедорожник"),
-    (2634, "Кабриолет"),
+/// Subset of what polovni offers — the 6 a personal-shopper would realistically
+/// tick. For an exotic body type (Minivan, Pickup), fall back to
+/// `SEARCH_CHASSIS` in `.env`.
+pub(super) const CHASSIS_CODES: &[u32] = &[2627, 2628, 2629, 2631, 2632, 2634];
+
+/// Gearbox codes offered in the gearbox picker (#7), in display order. Unlike
+/// chassis this is the site's **complete** list (the `SEARCH_GEARBOX` env
+/// escape hatch still exists for symmetry). Labels:
+/// [`crate::i18n::Lang::gearbox_label`].
+pub(super) const GEARBOX_CODES: &[u32] = &[3210, 3211, 3212, 10795];
+
+/// Predefined poll-interval presets in seconds, in display order. The minimum
+/// (60s) matches `MIN_POLL_INTERVAL_SECS` so the picker never offers an illegal
+/// value; labels come from [`crate::i18n::Lang::interval_label`]. Non-preset
+/// intervals still go through `/interval N`.
+pub(super) const INTERVAL_SECS: &[u64] = &[60, 300, 600, 1800, 3600, 7200, 86_400];
+
+/// Predefined price ranges in EUR as `(from, to)` bounds — `0` on either side
+/// means "no bound there". Six buckets cover practically every used-car intent;
+/// custom ranges fall back to `.env` (`SEARCH_PRICE_FROM`/`SEARCH_PRICE_TO`).
+/// Localized labels: [`crate::i18n::Lang::price_range_label`].
+pub(super) const PRICE_RANGES: &[(u32, u32)] = &[
+    (0, 5_000),
+    (5_000, 10_000),
+    (10_000, 15_000),
+    (15_000, 25_000),
+    (25_000, 50_000),
+    (50_000, 0),
 ];
 
-/// Gearbox catalog: `(numeric_code, display_name)`. Codes come from the
-/// site's `<select name="gearbox[]">` filter — unlike chassis this is the
-/// **complete** list, so there's no `.env`-only exotic tail here (the env
-/// escape hatch `SEARCH_GEARBOX` still exists for symmetry with the other
-/// filters). Russian labels, same rationale as [`CHASSIS`].
-pub(super) const GEARBOX: &[(u32, &str)] = &[
-    (3210, "Механика (4 ст.)"),
-    (3211, "Механика (5 ст.)"),
-    (3212, "Механика (6 ст.)"),
-    (10795, "Автомат / полуавтомат"),
-];
-
-/// Predefined poll-interval presets in seconds. The minimum (60s) matches
-/// `MIN_POLL_INTERVAL_SECS` so the picker never offers an illegal value.
-/// For non-preset intervals, the user can still type `/interval N`.
-pub(super) const INTERVAL_PRESETS: &[(u64, &str)] = &[
-    (60, "1 мин"),
-    (300, "5 мин"),
-    (600, "10 мин"),
-    (1800, "30 мин"),
-    (3600, "1 час"),
-    (7200, "2 часа"),
-    (86_400, "сутки"),
-];
-
-/// Predefined price ranges, in EUR. `(from, to, display)` — `0` on either
-/// side means "no bound there". The list is intentionally short — six
-/// buckets cover practically every used-car shopping intent. Users who
-/// need a custom range fall back to `.env` (`SEARCH_PRICE_FROM`, `SEARCH_PRICE_TO`).
-pub(super) const PRICE_RANGES: &[(u32, u32, &str)] = &[
-    (0, 5_000, "До 5 000 €"),
-    (5_000, 10_000, "5–10 000 €"),
-    (10_000, 15_000, "10–15 000 €"),
-    (15_000, 25_000, "15–25 000 €"),
-    (25_000, 50_000, "25–50 000 €"),
-    (50_000, 0, "Более 50 000 €"),
-];
-
-/// Predefined year ranges. Same shape as price ranges but the numbers happen
-/// to fit `u16` — they're stored that way in `SearchFilter`. We use `u32`
-/// in the catalog for callback-data uniformity with prices.
-pub(super) const YEAR_RANGES: &[(u32, u32, &str)] = &[
-    (2024, 0, "2024 и новее"),
-    (2020, 2023, "2020–2023"),
-    (2015, 2019, "2015–2019"),
-    (2010, 2014, "2010–2014"),
-    (2005, 2009, "2005–2009"),
-    (0, 2004, "До 2005"),
+/// Predefined year ranges as `(from, to)` bounds, same convention as
+/// [`PRICE_RANGES`] (the numbers fit `u16`, but we keep `u32` for
+/// callback-data uniformity with prices). Labels:
+/// [`crate::i18n::Lang::year_range_label`].
+pub(super) const YEAR_RANGES: &[(u32, u32)] = &[
+    (2024, 0),
+    (2020, 2023),
+    (2015, 2019),
+    (2010, 2014),
+    (2005, 2009),
+    (0, 2004),
 ];
 
 /// Model catalog, keyed by the brand's `slug` (matches the `0`-th column of
@@ -345,48 +326,10 @@ pub(super) const BRANDS: &[(&str, &str)] = &[
     ("volvo", "Volvo"),
 ];
 
-/// Reverse lookup: chassis code → human label from the [`CHASSIS`] catalog.
-/// Codes set via `SEARCH_CHASSIS` in `.env` may be outside the catalog —
-/// those render as the raw number so nothing is silently hidden (issue #4).
-pub(super) fn chassis_label(code: u32) -> String {
-    CHASSIS
-        .iter()
-        .find(|(c, _)| *c == code)
-        .map(|(_, name)| (*name).to_string())
-        .unwrap_or_else(|| code.to_string())
-}
-
-/// Reverse lookup: gearbox code → human label from the [`GEARBOX`] catalog.
-/// Same raw-number fallback as [`chassis_label`] for out-of-catalog codes
-/// coming from `SEARCH_GEARBOX` in `.env`.
-pub(super) fn gearbox_label(code: u32) -> String {
-    GEARBOX
-        .iter()
-        .find(|(c, _)| *c == code)
-        .map(|(_, name)| (*name).to_string())
-        .unwrap_or_else(|| code.to_string())
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
     use super::*;
-
-    #[test]
-    fn chassis_label_maps_known_codes_and_passes_through_unknown() {
-        assert_eq!(chassis_label(2634), "Кабриолет");
-        assert_eq!(chassis_label(2632), "Внедорожник");
-        // Not in the catalog (e.g. set via SEARCH_CHASSIS in .env) — raw code.
-        assert_eq!(chassis_label(9999), "9999");
-    }
-
-    #[test]
-    fn gearbox_label_maps_known_codes_and_passes_through_unknown() {
-        assert_eq!(gearbox_label(3211), "Механика (5 ст.)");
-        assert_eq!(gearbox_label(10795), "Автомат / полуавтомат");
-        // Out-of-catalog code from SEARCH_GEARBOX in .env — raw code.
-        assert_eq!(gearbox_label(9999), "9999");
-    }
 
     #[test]
     fn models_for_brand_finds_known_and_rejects_unknown() {

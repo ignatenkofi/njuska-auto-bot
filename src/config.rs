@@ -22,6 +22,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tracing::warn;
 use url::Url;
 
+use crate::i18n::Lang;
 use crate::models::{SearchFilter, ShowOldNew};
 use crate::storage::Storage;
 
@@ -54,6 +55,11 @@ pub const SETTING_SEARCH_PRICE_TO: &str = "search_price_to";
 /// Year range bounds. Same shape as price.
 pub const SETTING_SEARCH_YEAR_FROM: &str = "search_year_from";
 pub const SETTING_SEARCH_YEAR_TO: &str = "search_year_to";
+/// UI language (issue #33). Stores a [`Lang`] code (`"ru"`/`"sr"`). Absent key
+/// → use the env default (`BOT_LANG`, itself defaulting to Russian); set via
+/// the `/language` command. No "empty means cleared" state — a language is
+/// always one of the known codes, never "none".
+pub const SETTING_LANG: &str = "lang";
 
 // ---------------------------------------------------------------------------
 // StaticConfig
@@ -213,6 +219,11 @@ pub struct RuntimeConfig {
     /// `/resume`. Persisted in `runtime_settings` so a paused bot stays paused
     /// across restarts.
     pub paused: bool,
+    /// UI language for bot-authored strings (#33). Env default (`BOT_LANG`)
+    /// overridden by the persisted `/language` choice — same load precedence as
+    /// the other runtime knobs. Doesn't affect the poll loop (its operator
+    /// alerts are English), only command replies and the `/filter` wizard.
+    pub lang: Lang,
 }
 
 impl RuntimeConfig {
@@ -308,12 +319,47 @@ impl RuntimeConfig {
             None => false,
         };
 
+        // Language: env default (`BOT_LANG`), then the persisted `/language`
+        // override wins — same two-pass shape as the filter/interval knobs.
+        let mut lang = load_lang()?;
+        if let Some(s) = storage.get_setting(SETTING_LANG)? {
+            lang = parse_stored_lang(lang, &s);
+        }
+
         Ok(Self {
             search,
             poll_interval,
             paused,
+            lang,
         })
     }
+}
+
+/// Reads `BOT_LANG` as the startup default language. Unset/empty → Russian
+/// (the primary audience). A malformed value is a hard error, like the other
+/// operator-owned `.env` knobs (`SEARCH_SHOW_OLD_NEW`) — fail fast rather than
+/// silently guess.
+fn load_lang() -> Result<Lang> {
+    match opt_string("BOT_LANG") {
+        None => Ok(Lang::default()),
+        Some(s) => s
+            .parse::<Lang>()
+            .map_err(|e| anyhow!("BOT_LANG={s:?}: {e}")),
+    }
+}
+
+/// Range-checks a stored `/language` override. An unparseable value (manual DB
+/// edit, a future code this build doesn't know) loses to the env/default
+/// `fallback` — loudly, same contract as [`parse_stored_poll_interval`].
+fn parse_stored_lang(fallback: Lang, s: &str) -> Lang {
+    s.parse::<Lang>().unwrap_or_else(|_| {
+        warn!(
+            key = SETTING_LANG,
+            value = %s,
+            "unparseable language in runtime_settings; keeping env/default value"
+        );
+        fallback
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +783,40 @@ mod tests {
         unsafe {
             env::remove_var("SEARCH_GEARBOX");
         }
+    }
+
+    #[test]
+    fn lang_load_prefers_db_over_env_default() {
+        // Absent key → env default (BOT_LANG); set key → DB wins; garbage in DB
+        // → keep the fallback. Only this test touches BOT_LANG / SETTING_LANG,
+        // and no assertion here reads any other env-driven field, so the
+        // process-global env can't make it flaky.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(&dir.path().join("lang.db")).unwrap();
+        unsafe {
+            env::set_var("BOT_LANG", "sr");
+        }
+
+        // 1. Key absent → the env default shines through.
+        assert_eq!(RuntimeConfig::load(&storage).unwrap().lang, Lang::Sr);
+
+        // 2. Key set → DB wins over env.
+        storage.set_setting(SETTING_LANG, "ru").unwrap();
+        assert_eq!(RuntimeConfig::load(&storage).unwrap().lang, Lang::Ru);
+
+        // 3. Garbage in DB → keep the env/default fallback, don't crash.
+        storage.set_setting(SETTING_LANG, "de").unwrap();
+        assert_eq!(RuntimeConfig::load(&storage).unwrap().lang, Lang::Sr);
+
+        unsafe {
+            env::remove_var("BOT_LANG");
+        }
+    }
+
+    #[test]
+    fn parse_stored_lang_keeps_fallback_on_garbage() {
+        assert_eq!(parse_stored_lang(Lang::Ru, "sr"), Lang::Sr);
+        assert_eq!(parse_stored_lang(Lang::Sr, "potato"), Lang::Sr);
     }
 
     #[test]
