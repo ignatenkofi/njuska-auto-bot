@@ -40,6 +40,7 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{info, warn};
 
 use crate::config::{MIN_POLL_INTERVAL_SECS, RuntimeConfig, StaticConfig};
+use crate::i18n::Lang;
 use crate::signals::shutdown_signal;
 use crate::storage::Storage;
 
@@ -47,11 +48,10 @@ use crate::dyncatalog;
 
 use catalog::{PRICE_RANGES, YEAR_RANGES};
 use handlers::{
-    apply_brand, apply_chassis, apply_gearbox, apply_interval, apply_models, apply_price_range,
-    apply_reset_all, apply_year_range, format_cancel, format_filter_menu_body, format_filter_ru,
-    format_start, format_status, handle_clear, handle_clear_confirm, handle_diag, handle_dump,
-    handle_filter_start, handle_interval, handle_pause, handle_resume, handle_set_brand,
-    models_picker_title,
+    apply_brand, apply_chassis, apply_gearbox, apply_interval, apply_language, apply_models,
+    apply_price_range, apply_reset_all, apply_year_range, format_status, handle_clear,
+    handle_clear_confirm, handle_diag, handle_dump, handle_filter_start, handle_interval,
+    handle_language, handle_pause, handle_resume, handle_set_brand, help_text, models_picker_title,
 };
 use keyboards::{
     CB_FILTER_BRAND_CLEAR, CB_FILTER_BRAND_CUSTOM_HINT, CB_FILTER_BRAND_PAGE_PREFIX,
@@ -62,9 +62,9 @@ use keyboards::{
     CB_FILTER_MODELS_PAGE_PREFIX, CB_FILTER_MODELS_PICKER, CB_FILTER_MODELS_SAVE,
     CB_FILTER_MODELS_TOGGLE_PREFIX, CB_FILTER_NOOP, CB_FILTER_PRICE_PICKER,
     CB_FILTER_RANGE_SET_PREFIX, CB_FILTER_RESET_APPLY, CB_FILTER_RESET_CONFIRM, CB_FILTER_TODO,
-    CB_FILTER_YEAR_PICKER, brand_picker_keyboard, chassis_picker_keyboard, filter_menu_keyboard,
-    gearbox_picker_keyboard, interval_picker_keyboard, model_picker_keyboard,
-    range_picker_keyboard, reset_confirm_keyboard,
+    CB_FILTER_YEAR_PICKER, CB_LANG_SET_PREFIX, brand_picker_keyboard, chassis_picker_keyboard,
+    filter_menu_keyboard, gearbox_picker_keyboard, interval_picker_keyboard,
+    language_picker_keyboard, model_picker_keyboard, range_picker_keyboard, reset_confirm_keyboard,
 };
 
 /// Commands the bot understands.
@@ -120,6 +120,8 @@ pub enum Command {
     Diag,
     #[command(description = "Версия бота (crate + git SHA).")]
     Version,
+    #[command(description = "Сменить язык интерфейса (ru / sr). Пример: /language sr")]
+    Language(String),
 }
 
 /// How long after `/clear` a matching `/clear_confirm` is still accepted.
@@ -296,15 +298,21 @@ async fn handle_command(
     // branch unreachable.
     let sender_id = user_id.unwrap_or_default();
 
+    // The UI language for this reply, read once up front (#33). `Lang` is
+    // `Copy`, so threading it into the handlers is a cheap value pass; reading
+    // it once also keeps the reply self-consistent even if `/language` fires
+    // concurrently mid-handler.
+    let lang = ctx.runtime.read().await.lang;
+
     let reply: String = match cmd {
-        Command::Start => format_start(),
-        Command::Help => Command::descriptions().to_string(),
-        Command::Status => format_status(&ctx).await,
-        Command::Pause => handle_pause(&ctx).await,
-        Command::Resume => handle_resume(&ctx).await,
-        Command::Interval(secs) => handle_interval(&ctx, secs).await,
-        Command::Clear => handle_clear(&ctx, sender_id),
-        Command::ClearConfirm => handle_clear_confirm(&ctx, sender_id).await,
+        Command::Start => lang.start().to_string(),
+        Command::Help => help_text(lang),
+        Command::Status => format_status(lang, &ctx).await,
+        Command::Pause => handle_pause(lang, &ctx).await,
+        Command::Resume => handle_resume(lang, &ctx).await,
+        Command::Interval(secs) => handle_interval(lang, &ctx, secs).await,
+        Command::Clear => handle_clear(lang, &ctx, sender_id),
+        Command::ClearConfirm => handle_clear_confirm(lang, &ctx, sender_id).await,
         Command::Filter => {
             // /filter has a different reply shape than the rest — it sends a
             // message with an inline keyboard. We do that directly here
@@ -312,10 +320,14 @@ async fn handle_command(
             // `handle_filter_start` controls both text *and* markup.
             return handle_filter_start(bot, &msg, &ctx).await;
         }
-        Command::SetBrand(slug) => handle_set_brand(&ctx, slug).await,
-        Command::Dump(n) => handle_dump(&ctx, n).await,
-        Command::Cancel => format_cancel(),
-        Command::Diag => handle_diag(&ctx).await,
+        Command::Language(arg) => {
+            // Same message-with-keyboard shape as /filter — send directly.
+            return handle_language(bot, &msg, &ctx, arg).await;
+        }
+        Command::SetBrand(slug) => handle_set_brand(lang, &ctx, slug).await,
+        Command::Dump(n) => handle_dump(lang, &ctx, n).await,
+        Command::Cancel => lang.cancel().to_string(),
+        Command::Diag => handle_diag(lang, &ctx).await,
         Command::Version => format!("🤖 NjuskaAutoBot <b>{}</b>", crate::version::VERSION),
     };
 
@@ -351,8 +363,9 @@ async fn handle_unparsed_command(
         return Ok(());
     }
 
+    let lang = ctx.runtime.read().await.lang;
     info!(text, ?user_id, "command-shaped message failed to parse");
-    bot.send_message(msg.chat.id, handlers::usage_hint(text))
+    bot.send_message(msg.chat.id, handlers::usage_hint(lang, text))
         .parse_mode(ParseMode::Html)
         .await?;
     Ok(())
@@ -470,6 +483,9 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
     let chat_id = orig.chat().id;
     let message_id = orig.id();
 
+    // UI language for this render (#33), read once for the whole callback.
+    let lang = ctx.runtime.read().await.lang;
+
     let (text, markup): (String, Option<InlineKeyboardMarkup>) = match data {
         // Inert page-indicator button in a paginated picker — the spinner was
         // already answered above; nothing to redraw.
@@ -484,8 +500,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format_filter_menu_body(&search, interval_secs),
-                Some(filter_menu_keyboard()),
+                lang.filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         CB_FILTER_BRAND_PICKER => {
@@ -496,8 +512,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             spawn_brand_refresh(&ctx);
             let brands = dyncatalog::brands_or_fallback(&ctx.storage);
             (
-                "Выбери марку:".to_string(),
-                Some(brand_picker_keyboard(&brands, 0)),
+                lang.brand_picker_title().to_string(),
+                Some(brand_picker_keyboard(lang, &brands, 0)),
             )
         }
         s if s.starts_with(CB_FILTER_BRAND_PAGE_PREFIX) => {
@@ -508,24 +524,15 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 .unwrap_or(0);
             let brands = dyncatalog::brands_or_fallback(&ctx.storage);
             (
-                "Выбери марку:".to_string(),
-                Some(brand_picker_keyboard(&brands, page)),
+                lang.brand_picker_title().to_string(),
+                Some(brand_picker_keyboard(lang, &brands, page)),
             )
         }
         CB_FILTER_BRAND_CUSTOM_HINT => {
             let brands = dyncatalog::brands_or_fallback(&ctx.storage);
             (
-                "💬 <b>Бренд вне каталога?</b>\n\n\
-                 Обычно это не нужно — список марок теперь подтягивается с сайта \
-                 целиком. Но если фетч не удался или марки всё равно нет, \
-                 отправь <code>/setbrand &lt;slug&gt;</code>.\n\
-                 Slug — значение из URL polovniautomobili.com в параметре \
-                 <code>brand=</code>.\n\n\
-                 Примеры: <code>/setbrand smart</code>, <code>/setbrand suzuki</code>, \
-                 <code>/setbrand alfa-romeo</code>.\n\n\
-                 Если потом захочешь обратно в каталог — открой ✏️ Марка."
-                    .into(),
-                Some(brand_picker_keyboard(&brands, 0)),
+                lang.brand_custom_hint().to_string(),
+                Some(brand_picker_keyboard(lang, &brands, 0)),
             )
         }
         CB_FILTER_BRAND_CLEAR => {
@@ -535,8 +542,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format_filter_menu_body(&search, interval_secs),
-                Some(filter_menu_keyboard()),
+                lang.filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         CB_FILTER_CHASSIS_PICKER => {
@@ -545,8 +552,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             let initial = ctx.runtime.read().await.search.chassis.clone();
             lock_unpoisoned(&ctx.chassis_draft).insert(user_id, initial.clone());
             (
-                "Выбери типы кузова (можно несколько):".to_string(),
-                Some(chassis_picker_keyboard(&initial)),
+                lang.chassis_picker_title().to_string(),
+                Some(chassis_picker_keyboard(lang, &initial)),
             )
         }
         CB_FILTER_CHASSIS_SAVE => {
@@ -561,8 +568,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format_filter_menu_body(&search, interval_secs),
-                Some(filter_menu_keyboard()),
+                lang.filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         CB_FILTER_GEARBOX_PICKER => {
@@ -570,8 +577,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             let initial = ctx.runtime.read().await.search.gearbox.clone();
             lock_unpoisoned(&ctx.gearbox_draft).insert(user_id, initial.clone());
             (
-                "Выбери типы КПП (можно несколько):".to_string(),
-                Some(gearbox_picker_keyboard(&initial)),
+                lang.gearbox_picker_title().to_string(),
+                Some(gearbox_picker_keyboard(lang, &initial)),
             )
         }
         CB_FILTER_GEARBOX_SAVE => {
@@ -584,8 +591,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format_filter_menu_body(&search, interval_secs),
-                Some(filter_menu_keyboard()),
+                lang.filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         CB_FILTER_DONE => {
@@ -596,15 +603,11 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
 
             let search = ctx.runtime.read().await.search.clone();
             // Final state: text only, no keyboard. `markup = None` clears it.
-            (
-                format!("✅ Фильтры сохранены.\n\n{}", format_filter_ru(&search)),
-                None,
-            )
+            (lang.filter_saved(&lang.filter_summary(&search)), None)
         }
         CB_FILTER_TODO => (
-            "🔧 Эта секция фильтра будет в следующих сессиях.\n\nПока возвращаемся в меню."
-                .to_string(),
-            Some(filter_menu_keyboard()),
+            lang.filter_todo().to_string(),
+            Some(filter_menu_keyboard(lang)),
         ),
         CB_FILTER_RESET_CONFIRM => {
             // Show current filters in the confirmation so the user sees what
@@ -612,20 +615,15 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // `CB_FILTER_RESET_APPLY` below.
             let search = ctx.runtime.read().await.search.clone();
             (
-                format!(
-                    "⚠️ <b>Сбросить все фильтры?</b>\n\n\
-                     Сейчас стоит:\n{}\n\n\
-                     После сброса бот будет видеть весь каталог.",
-                    format_filter_ru(&search)
-                ),
-                Some(reset_confirm_keyboard()),
+                lang.reset_confirm(&lang.filter_summary(&search)),
+                Some(reset_confirm_keyboard(lang)),
             )
         }
         CB_FILTER_INTERVAL_PICKER => {
             let current_secs = ctx.runtime.read().await.poll_interval.as_secs();
             (
-                "Выбери интервал поллинга:".to_string(),
-                Some(interval_picker_keyboard(current_secs)),
+                lang.interval_picker_title().to_string(),
+                Some(interval_picker_keyboard(lang, current_secs)),
             )
         }
         s if s.starts_with(CB_FILTER_INTERVAL_SET_PREFIX) => {
@@ -635,14 +633,14 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             let secs = s[CB_FILTER_INTERVAL_SET_PREFIX.len()..]
                 .parse::<u64>()
                 .unwrap_or(MIN_POLL_INTERVAL_SECS);
-            let _ = apply_interval(&ctx, secs).await;
+            let _ = apply_interval(lang, &ctx, secs).await;
             let (search, interval_secs) = {
                 let r = ctx.runtime.read().await;
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format_filter_menu_body(&search, interval_secs),
-                Some(filter_menu_keyboard()),
+                lang.filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         CB_FILTER_RESET_APPLY => {
@@ -652,11 +650,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format!(
-                    "🧹 <b>Фильтры сброшены.</b>\n\n{}",
-                    format_filter_menu_body(&search, interval_secs)
-                ),
-                Some(filter_menu_keyboard()),
+                lang.filters_reset(&lang.filter_menu_body(&search, interval_secs)),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         s if s.starts_with(CB_FILTER_BRAND_SET_PREFIX) => {
@@ -667,8 +662,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format_filter_menu_body(&search, interval_secs),
-                Some(filter_menu_keyboard()),
+                lang.filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         CB_FILTER_PRICE_PICKER => {
@@ -677,8 +672,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.price_from, r.search.price_to)
             };
             (
-                "Выбери диапазон цены:".to_string(),
-                Some(range_picker_keyboard("price", PRICE_RANGES, cur)),
+                lang.price_picker_title().to_string(),
+                Some(range_picker_keyboard(lang, "price", PRICE_RANGES, cur)),
             )
         }
         CB_FILTER_YEAR_PICKER => {
@@ -692,8 +687,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 )
             };
             (
-                "Выбери диапазон года выпуска:".to_string(),
-                Some(range_picker_keyboard("year", YEAR_RANGES, cur)),
+                lang.year_picker_title().to_string(),
+                Some(range_picker_keyboard(lang, "year", YEAR_RANGES, cur)),
             )
         }
         s if s.starts_with(CB_FILTER_RANGE_SET_PREFIX) => {
@@ -720,8 +715,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format_filter_menu_body(&search, interval_secs),
-                Some(filter_menu_keyboard()),
+                lang.filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         CB_FILTER_MODELS_PICKER => {
@@ -746,8 +741,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 None => {
                     let brands = dyncatalog::brands_or_fallback(&ctx.storage);
                     (
-                        "❌ Сначала выбери марку — без неё список моделей не известен:".into(),
-                        Some(brand_picker_keyboard(&brands, 0)),
+                        lang.models_pick_brand_first().to_string(),
+                        Some(brand_picker_keyboard(lang, &brands, 0)),
                     )
                 }
                 Some(brand_slug) => {
@@ -758,19 +753,14 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                     let model_list = dyncatalog::models_or_fallback(&ctx.storage, &brand_slug);
                     if model_list.is_empty() {
                         (
-                            format!(
-                                "🤷 Для марки <code>{}</code> у меня нет каталога моделей.\n\n\
-                                 Поставь модели через <code>SEARCH_MODEL</code> в \
-                                 <code>.env</code>, либо смени марку через ✏️ Марка.",
-                                crate::telegram::escape_html(&brand_slug)
-                            ),
-                            Some(filter_menu_keyboard()),
+                            lang.no_models_for_brand(&crate::telegram::escape_html(&brand_slug)),
+                            Some(filter_menu_keyboard(lang)),
                         )
                     } else {
                         lock_unpoisoned(&ctx.models_draft).insert(user_id, initial_models.clone());
                         (
-                            models_picker_title(&brand_slug),
-                            Some(model_picker_keyboard(&model_list, &initial_models, 0)),
+                            models_picker_title(lang, &brand_slug),
+                            Some(model_picker_keyboard(lang, &model_list, &initial_models, 0)),
                         )
                     }
                 }
@@ -796,8 +786,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 .cloned()
                 .unwrap_or_default();
             (
-                models_picker_title(&brand_slug),
-                Some(model_picker_keyboard(&model_list, &selected, page)),
+                models_picker_title(lang, &brand_slug),
+                Some(model_picker_keyboard(lang, &model_list, &selected, page)),
             )
         }
         CB_FILTER_MODELS_SAVE => {
@@ -810,8 +800,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 (r.search.clone(), r.poll_interval.as_secs())
             };
             (
-                format_filter_menu_body(&search, interval_secs),
-                Some(filter_menu_keyboard()),
+                lang.filter_menu_body(&search, interval_secs),
+                Some(filter_menu_keyboard(lang)),
             )
         }
         s if s.starts_with(CB_FILTER_MODELS_TOGGLE_PREFIX) => {
@@ -839,8 +829,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             }
             let new_state = toggle_in_draft(&ctx.models_draft, user_id, slug.to_owned());
             (
-                models_picker_title(&brand_slug),
-                Some(model_picker_keyboard(&model_list, &new_state, page)),
+                models_picker_title(lang, &brand_slug),
+                Some(model_picker_keyboard(lang, &model_list, &new_state, page)),
             )
         }
         s if s.starts_with(CB_FILTER_CHASSIS_TOGGLE_PREFIX) => {
@@ -852,8 +842,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             // never hold the Mutex past the lock scope.
             let new_state = toggle_in_draft(&ctx.chassis_draft, user_id, code);
             (
-                "Выбери типы кузова (можно несколько):".to_string(),
-                Some(chassis_picker_keyboard(&new_state)),
+                lang.chassis_picker_title().to_string(),
+                Some(chassis_picker_keyboard(lang, &new_state)),
             )
         }
         s if s.starts_with(CB_FILTER_GEARBOX_TOGGLE_PREFIX) => {
@@ -863,8 +853,23 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
             };
             let new_state = toggle_in_draft(&ctx.gearbox_draft, user_id, code);
             (
-                "Выбери типы КПП (можно несколько):".to_string(),
-                Some(gearbox_picker_keyboard(&new_state)),
+                lang.gearbox_picker_title().to_string(),
+                Some(gearbox_picker_keyboard(lang, &new_state)),
+            )
+        }
+        s if s.starts_with(CB_LANG_SET_PREFIX) => {
+            // /language picker tap (#33). Apply the chosen language, then
+            // re-render the picker in the NEW language (current marked) so the
+            // user can switch straight back if they mis-tapped.
+            let code = &s[CB_LANG_SET_PREFIX.len()..];
+            let Ok(new_lang) = code.parse::<Lang>() else {
+                warn!(unknown = s, "language set with unknown code");
+                return Ok(());
+            };
+            apply_language(&ctx, new_lang).await;
+            (
+                new_lang.language_screen(),
+                Some(language_picker_keyboard(new_lang)),
             )
         }
         other => {

@@ -8,7 +8,8 @@
 
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-use super::catalog::{CHASSIS, GEARBOX, INTERVAL_PRESETS};
+use super::catalog::{CHASSIS_CODES, GEARBOX_CODES, INTERVAL_SECS};
+use crate::i18n::Lang;
 
 /// Show the top-level filter menu.
 pub(super) const CB_FILTER_MENU: &str = "f:menu";
@@ -84,6 +85,11 @@ pub(super) const CB_FILTER_MODELS_SAVE: &str = "f:models_save";
 /// Jump the model picker to a page: `f:models_page:<page>`.
 pub(super) const CB_FILTER_MODELS_PAGE_PREFIX: &str = "f:models_page:";
 
+// Language picker (issue #33). Not under the `f:` (filter) namespace — it's a
+// standalone `/language` screen, so it gets its own `lang:` prefix. Data is
+// `lang:set:<code>` where `<code>` is a `Lang::as_code()` value (ru/sr).
+pub(super) const CB_LANG_SET_PREFIX: &str = "lang:set:";
+
 /// Brands per page in the (paginated) brand picker — 4 rows of 4.
 const BRANDS_PER_PAGE: usize = 16;
 /// Models per page — 6 rows of 2. A touch smaller than brands because model
@@ -155,27 +161,27 @@ fn page_nav_row<T>(p: &Page<'_, T>, page_prefix: &str) -> Option<Vec<InlineKeybo
 /// Top-level menu keyboard: one button per filter section, plus Done.
 /// Each button label is just the section name — values are in the message
 /// body. (Putting values on labels would make them long and ugly.)
-pub(super) fn filter_menu_keyboard() -> InlineKeyboardMarkup {
+pub(super) fn filter_menu_keyboard(lang: Lang) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("✏️ Марка", CB_FILTER_BRAND_PICKER),
-            InlineKeyboardButton::callback("✏️ Модели", CB_FILTER_MODELS_PICKER),
+            InlineKeyboardButton::callback(lang.btn_brand(), CB_FILTER_BRAND_PICKER),
+            InlineKeyboardButton::callback(lang.btn_models(), CB_FILTER_MODELS_PICKER),
         ],
         vec![
-            InlineKeyboardButton::callback("✏️ Кузов", CB_FILTER_CHASSIS_PICKER),
-            InlineKeyboardButton::callback("✏️ КПП", CB_FILTER_GEARBOX_PICKER),
+            InlineKeyboardButton::callback(lang.btn_chassis(), CB_FILTER_CHASSIS_PICKER),
+            InlineKeyboardButton::callback(lang.btn_gearbox(), CB_FILTER_GEARBOX_PICKER),
         ],
         vec![
-            InlineKeyboardButton::callback("✏️ Цена", CB_FILTER_PRICE_PICKER),
-            InlineKeyboardButton::callback("✏️ Год", CB_FILTER_YEAR_PICKER),
+            InlineKeyboardButton::callback(lang.btn_price(), CB_FILTER_PRICE_PICKER),
+            InlineKeyboardButton::callback(lang.btn_year(), CB_FILTER_YEAR_PICKER),
         ],
         vec![InlineKeyboardButton::callback(
-            "⏱ Интервал",
+            lang.btn_interval(),
             CB_FILTER_INTERVAL_PICKER,
         )],
         vec![
-            InlineKeyboardButton::callback("🧹 Сбросить", CB_FILTER_RESET_CONFIRM),
-            InlineKeyboardButton::callback("✅ Готово", CB_FILTER_DONE),
+            InlineKeyboardButton::callback(lang.btn_reset(), CB_FILTER_RESET_CONFIRM),
+            InlineKeyboardButton::callback(lang.btn_done(), CB_FILTER_DONE),
         ],
     ])
 }
@@ -183,16 +189,16 @@ pub(super) fn filter_menu_keyboard() -> InlineKeyboardMarkup {
 /// Interval picker keyboard. Same single-tap-commit pattern as price/year
 /// (no draft state); the `✓` highlights the currently-selected interval if
 /// it matches a preset.
-pub(super) fn interval_picker_keyboard(current_secs: u64) -> InlineKeyboardMarkup {
-    let mut rows: Vec<Vec<InlineKeyboardButton>> = INTERVAL_PRESETS
+pub(super) fn interval_picker_keyboard(lang: Lang, current_secs: u64) -> InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = INTERVAL_SECS
         .chunks(2)
         .map(|chunk| {
             chunk
                 .iter()
-                .map(|(secs, display)| {
+                .map(|secs| {
                     let prefix = if *secs == current_secs { "✓ " } else { "" };
                     InlineKeyboardButton::callback(
-                        format!("{prefix}{display}"),
+                        format!("{prefix}{}", lang.interval_label(*secs)),
                         format!("{CB_FILTER_INTERVAL_SET_PREFIX}{secs}"),
                     )
                 })
@@ -200,7 +206,7 @@ pub(super) fn interval_picker_keyboard(current_secs: u64) -> InlineKeyboardMarku
         })
         .collect();
     rows.push(vec![InlineKeyboardButton::callback(
-        "↩️ Назад",
+        lang.btn_back(),
         CB_FILTER_MENU,
     )]);
     InlineKeyboardMarkup::new(rows)
@@ -209,10 +215,10 @@ pub(super) fn interval_picker_keyboard(current_secs: u64) -> InlineKeyboardMarku
 /// Two-button confirmation keyboard used for the "Reset all filters?" prompt.
 /// `[↩️ Отмена]` reuses `CB_FILTER_MENU` so the central back-to-menu logic
 /// (drafts cleanup, menu redraw) handles it without a new branch.
-pub(super) fn reset_confirm_keyboard() -> InlineKeyboardMarkup {
+pub(super) fn reset_confirm_keyboard(lang: Lang) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("✅ Да, стереть", CB_FILTER_RESET_APPLY),
-        InlineKeyboardButton::callback("↩️ Отмена", CB_FILTER_MENU),
+        InlineKeyboardButton::callback(lang.btn_reset_yes(), CB_FILTER_RESET_APPLY),
+        InlineKeyboardButton::callback(lang.btn_cancel(), CB_FILTER_MENU),
     ]])
 }
 
@@ -224,14 +230,21 @@ pub(super) fn reset_confirm_keyboard() -> InlineKeyboardMarkup {
 /// `(None, None)`. Custom ranges set via env get no highlight — that's fine,
 /// they're an escape hatch, not a UI state.
 pub(super) fn range_picker_keyboard(
+    lang: Lang,
     field: &str,
-    catalog: &[(u32, u32, &str)],
+    catalog: &[(u32, u32)],
     current: (Option<u32>, Option<u32>),
 ) -> InlineKeyboardMarkup {
     let mark = |btn_from: u32, btn_to: u32| -> &'static str {
         let cf = if btn_from == 0 { None } else { Some(btn_from) };
         let ct = if btn_to == 0 { None } else { Some(btn_to) };
         if (cf, ct) == current { "✓ " } else { "" }
+    };
+    // `field` picks which localized label set to use; the catalog now carries
+    // only the bounds (display text moved to `i18n` in #33).
+    let label = |from: u32, to: u32| match field {
+        "year" => lang.year_range_label(from, to),
+        _ => lang.price_range_label(from, to),
     };
 
     // 2 buttons per row for the presets.
@@ -240,9 +253,9 @@ pub(super) fn range_picker_keyboard(
         .map(|chunk| {
             chunk
                 .iter()
-                .map(|(from, to, display)| {
+                .map(|(from, to)| {
                     InlineKeyboardButton::callback(
-                        format!("{}{}", mark(*from, *to), display),
+                        format!("{}{}", mark(*from, *to), label(*from, *to)),
                         format!("{CB_FILTER_RANGE_SET_PREFIX}{field}:{from}:{to}"),
                     )
                 })
@@ -251,13 +264,13 @@ pub(super) fn range_picker_keyboard(
         .collect();
 
     // Trailing row: "no filter" + back.
-    let no_filter_label = format!("{}Без фильтра", mark(0, 0));
+    let no_filter_label = format!("{}{}", mark(0, 0), lang.btn_no_filter());
     rows.push(vec![
         InlineKeyboardButton::callback(
             no_filter_label,
             format!("{CB_FILTER_RANGE_SET_PREFIX}{field}:0:0"),
         ),
-        InlineKeyboardButton::callback("↩️ Назад", CB_FILTER_MENU),
+        InlineKeyboardButton::callback(lang.btn_back(), CB_FILTER_MENU),
     ]);
     InlineKeyboardMarkup::new(rows)
 }
@@ -277,6 +290,7 @@ pub(super) fn range_picker_keyboard(
 /// Each toggle callback embeds `page` so the redraw after a tap stays on the
 /// page the user is looking at rather than jumping back to the first.
 pub(super) fn model_picker_keyboard(
+    lang: Lang,
     models: &[(String, String)],
     selected: &[String],
     page: usize,
@@ -303,12 +317,12 @@ pub(super) fn model_picker_keyboard(
         rows.push(nav);
     }
     rows.push(vec![InlineKeyboardButton::callback(
-        "💾 Сохранить",
+        lang.btn_save(),
         CB_FILTER_MODELS_SAVE,
     )]);
     rows.push(vec![
-        InlineKeyboardButton::callback("↩️ К маркам (без сохранения)", CB_FILTER_BRAND_PICKER),
-        InlineKeyboardButton::callback("🏠 В меню", CB_FILTER_MENU),
+        InlineKeyboardButton::callback(lang.btn_back_to_brands_no_save(), CB_FILTER_BRAND_PICKER),
+        InlineKeyboardButton::callback(lang.btn_to_menu(), CB_FILTER_MENU),
     ]);
     InlineKeyboardMarkup::new(rows)
 }
@@ -319,13 +333,13 @@ pub(super) fn model_picker_keyboard(
 ///
 /// Rebuilt fresh on every render — there's no clever caching. With 6 items
 /// it costs nothing.
-pub(super) fn chassis_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup {
-    let mut rows: Vec<Vec<InlineKeyboardButton>> = CHASSIS
+pub(super) fn chassis_picker_keyboard(lang: Lang, selected: &[u32]) -> InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = CHASSIS_CODES
         .chunks(2)
         .map(|chunk| {
             chunk
                 .iter()
-                .map(|(code, display)| {
+                .map(|code| {
                     // ✓ / ⬜ prefix communicates checked state. The `code` is
                     // baked into callback_data so the handler doesn't need to
                     // look up the label-to-code mapping.
@@ -335,7 +349,7 @@ pub(super) fn chassis_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup 
                         "⬜ "
                     };
                     InlineKeyboardButton::callback(
-                        format!("{prefix}{display}"),
+                        format!("{prefix}{}", lang.chassis_label(*code)),
                         format!("{CB_FILTER_CHASSIS_TOGGLE_PREFIX}{code}"),
                     )
                 })
@@ -343,8 +357,8 @@ pub(super) fn chassis_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup 
         })
         .collect();
     rows.push(vec![
-        InlineKeyboardButton::callback("💾 Сохранить", CB_FILTER_CHASSIS_SAVE),
-        InlineKeyboardButton::callback("↩️ Назад (без сохранения)", CB_FILTER_MENU),
+        InlineKeyboardButton::callback(lang.btn_save(), CB_FILTER_CHASSIS_SAVE),
+        InlineKeyboardButton::callback(lang.btn_back_no_save(), CB_FILTER_MENU),
     ]);
     InlineKeyboardMarkup::new(rows)
 }
@@ -352,20 +366,20 @@ pub(super) fn chassis_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup 
 /// Gearbox picker keyboard (#7): same multi-select shape as the chassis
 /// picker (✓/⬜ prefixes, toggle callbacks, Save/Back row) over the 4-entry
 /// [`GEARBOX`] catalog.
-pub(super) fn gearbox_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup {
-    let mut rows: Vec<Vec<InlineKeyboardButton>> = GEARBOX
+pub(super) fn gearbox_picker_keyboard(lang: Lang, selected: &[u32]) -> InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = GEARBOX_CODES
         .chunks(2)
         .map(|chunk| {
             chunk
                 .iter()
-                .map(|(code, display)| {
+                .map(|code| {
                     let prefix = if selected.contains(code) {
                         "✓ "
                     } else {
                         "⬜ "
                     };
                     InlineKeyboardButton::callback(
-                        format!("{prefix}{display}"),
+                        format!("{prefix}{}", lang.gearbox_label(*code)),
                         format!("{CB_FILTER_GEARBOX_TOGGLE_PREFIX}{code}"),
                     )
                 })
@@ -373,8 +387,8 @@ pub(super) fn gearbox_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup 
         })
         .collect();
     rows.push(vec![
-        InlineKeyboardButton::callback("💾 Сохранить", CB_FILTER_GEARBOX_SAVE),
-        InlineKeyboardButton::callback("↩️ Назад (без сохранения)", CB_FILTER_MENU),
+        InlineKeyboardButton::callback(lang.btn_save(), CB_FILTER_GEARBOX_SAVE),
+        InlineKeyboardButton::callback(lang.btn_back_no_save(), CB_FILTER_MENU),
     ]);
     InlineKeyboardMarkup::new(rows)
 }
@@ -387,6 +401,7 @@ pub(super) fn gearbox_picker_keyboard(selected: &[u32]) -> InlineKeyboardMarkup 
 /// Takes owned `(slug, display)` pairs for the same reason as
 /// [`model_picker_keyboard`]: the list comes from the runtime catalog cache.
 pub(super) fn brand_picker_keyboard(
+    lang: Lang,
     brands: &[(String, String)],
     page: usize,
 ) -> InlineKeyboardMarkup {
@@ -410,14 +425,32 @@ pub(super) fn brand_picker_keyboard(
         rows.push(nav);
     }
     rows.push(vec![
-        InlineKeyboardButton::callback("⏭ Без фильтра", CB_FILTER_BRAND_CLEAR),
-        InlineKeyboardButton::callback("💬 Ввести вручную", CB_FILTER_BRAND_CUSTOM_HINT),
+        InlineKeyboardButton::callback(lang.btn_brand_skip(), CB_FILTER_BRAND_CLEAR),
+        InlineKeyboardButton::callback(lang.btn_brand_manual(), CB_FILTER_BRAND_CUSTOM_HINT),
     ]);
     rows.push(vec![InlineKeyboardButton::callback(
-        "↩️ Назад",
+        lang.btn_back(),
         CB_FILTER_MENU,
     )]);
     InlineKeyboardMarkup::new(rows)
+}
+
+/// Language picker (issue #33). One button per known [`Lang`], current one
+/// marked with `✓`. Standalone — reached only via `/language`, never from the
+/// `/filter` menu — so it carries no back-to-menu button; tapping a language
+/// re-renders this picker in the newly-selected language.
+pub(super) fn language_picker_keyboard(current: Lang) -> InlineKeyboardMarkup {
+    let row: Vec<InlineKeyboardButton> = Lang::ALL
+        .iter()
+        .map(|l| {
+            let prefix = if *l == current { "✓ " } else { "" };
+            InlineKeyboardButton::callback(
+                format!("{prefix}{}", l.native_name()),
+                format!("{CB_LANG_SET_PREFIX}{}", l.as_code()),
+            )
+        })
+        .collect();
+    InlineKeyboardMarkup::new(vec![row])
 }
 
 #[cfg(test)]
@@ -475,17 +508,18 @@ mod tests {
             .collect();
 
         let keyboards = [
-            filter_menu_keyboard(),
-            brand_picker_keyboard(&brands(), 0),
-            brand_picker_keyboard(&synthetic(200), 5),
-            chassis_picker_keyboard(&[2634]),
-            gearbox_picker_keyboard(&[10795]),
-            interval_picker_keyboard(600),
-            reset_confirm_keyboard(),
-            range_picker_keyboard("price", PRICE_RANGES, (None, None)),
-            range_picker_keyboard("year", YEAR_RANGES, (None, None)),
-            model_picker_keyboard(&owned(models_for_brand("mini").unwrap()), &[], 0),
-            model_picker_keyboard(&monster, &[], 9),
+            filter_menu_keyboard(Lang::Ru),
+            brand_picker_keyboard(Lang::Ru, &brands(), 0),
+            brand_picker_keyboard(Lang::Ru, &synthetic(200), 5),
+            chassis_picker_keyboard(Lang::Ru, &[2634]),
+            gearbox_picker_keyboard(Lang::Ru, &[10795]),
+            interval_picker_keyboard(Lang::Ru, 600),
+            reset_confirm_keyboard(Lang::Ru),
+            range_picker_keyboard(Lang::Ru, "price", PRICE_RANGES, (None, None)),
+            range_picker_keyboard(Lang::Ru, "year", YEAR_RANGES, (None, None)),
+            model_picker_keyboard(Lang::Ru, &owned(models_for_brand("mini").unwrap()), &[], 0),
+            model_picker_keyboard(Lang::Ru, &monster, &[], 9),
+            language_picker_keyboard(Lang::Sr),
         ];
         for kb in &keyboards {
             for btn in all_buttons(kb) {
@@ -497,15 +531,12 @@ mod tests {
     #[test]
     fn interval_buttons_round_trip_through_the_callback_parser() {
         // Same parse the handler does: strip prefix, parse u64.
-        let kb = interval_picker_keyboard(600);
+        let kb = interval_picker_keyboard(Lang::Ru, 600);
         let parsed: Vec<u64> = all_buttons(&kb)
             .filter_map(|b| data(b).strip_prefix(CB_FILTER_INTERVAL_SET_PREFIX))
             .map(|tail| tail.parse::<u64>().unwrap())
             .collect();
-        let presets: Vec<u64> = super::super::catalog::INTERVAL_PRESETS
-            .iter()
-            .map(|(s, _)| *s)
-            .collect();
+        let presets: Vec<u64> = super::super::catalog::INTERVAL_SECS.to_vec();
         assert_eq!(parsed, presets);
         // Current value is marked, exactly once.
         let marked = all_buttons(&kb)
@@ -517,7 +548,8 @@ mod tests {
     #[test]
     fn range_buttons_round_trip_field_from_to() {
         // Handler-side parse: strip CB_FILTER_RANGE_SET_PREFIX, splitn(3, ':').
-        let kb = range_picker_keyboard("price", PRICE_RANGES, (Some(5_000), Some(10_000)));
+        let kb =
+            range_picker_keyboard(Lang::Ru, "price", PRICE_RANGES, (Some(5_000), Some(10_000)));
         let mut seen = Vec::new();
         for btn in all_buttons(&kb) {
             let Some(tail) = data(btn).strip_prefix(CB_FILTER_RANGE_SET_PREFIX) else {
@@ -543,7 +575,7 @@ mod tests {
 
     #[test]
     fn chassis_buttons_round_trip_codes_and_show_selection() {
-        let kb = chassis_picker_keyboard(&[2632]);
+        let kb = chassis_picker_keyboard(Lang::Ru, &[2632]);
         for btn in all_buttons(&kb) {
             let Some(tail) = data(btn).strip_prefix(CB_FILTER_CHASSIS_TOGGLE_PREFIX) else {
                 continue; // Save / Back row
@@ -556,7 +588,7 @@ mod tests {
 
     #[test]
     fn gearbox_buttons_round_trip_codes_and_show_selection() {
-        let kb = gearbox_picker_keyboard(&[10795]);
+        let kb = gearbox_picker_keyboard(Lang::Ru, &[10795]);
         let mut toggles = 0;
         for btn in all_buttons(&kb) {
             let Some(tail) = data(btn).strip_prefix(CB_FILTER_GEARBOX_TOGGLE_PREFIX) else {
@@ -569,13 +601,13 @@ mod tests {
         }
         // The site's gearbox list is complete — every catalog entry must be
         // a button.
-        assert_eq!(toggles, GEARBOX.len());
+        assert_eq!(toggles, GEARBOX_CODES.len());
     }
 
     #[test]
     fn model_buttons_round_trip_slugs_and_show_selection() {
         let models = owned(models_for_brand("mini").unwrap());
-        let kb = model_picker_keyboard(&models, &["cooper".to_string()], 0);
+        let kb = model_picker_keyboard(Lang::Ru, &models, &["cooper".to_string()], 0);
         let mut toggles = 0;
         for btn in all_buttons(&kb) {
             let Some(tail) = data(btn).strip_prefix(CB_FILTER_MODELS_TOGGLE_PREFIX) else {
@@ -599,7 +631,7 @@ mod tests {
         // #6: models hang under a brand, so "back" = brand picker; the menu
         // must stay one tap away via its own button.
         let models = owned(models_for_brand("mini").unwrap());
-        let kb = model_picker_keyboard(&models, &[], 0);
+        let kb = model_picker_keyboard(Lang::Ru, &models, &[], 0);
         let datas: Vec<&str> = all_buttons(&kb).map(data).collect();
         assert!(datas.contains(&CB_FILTER_BRAND_PICKER), "{datas:?}");
         assert!(datas.contains(&CB_FILTER_MENU), "{datas:?}");
@@ -614,7 +646,7 @@ mod tests {
         let models = synthetic(30);
         let selected = vec!["m20".to_string()]; // lives on page 1 (indices 12..24)
 
-        let p0 = model_picker_keyboard(&models, &selected, 0);
+        let p0 = model_picker_keyboard(Lang::Ru, &models, &selected, 0);
         let toggles0 = all_buttons(&p0)
             .filter(|b| data(b).starts_with(CB_FILTER_MODELS_TOGGLE_PREFIX))
             .count();
@@ -629,7 +661,7 @@ mod tests {
         assert!(all_buttons(&p0).any(|b| b.text == "1/3"), "indicator 1/3");
 
         // Page 1: both arrows, and the selected m20 renders checked.
-        let p1 = model_picker_keyboard(&models, &selected, 1);
+        let p1 = model_picker_keyboard(Lang::Ru, &models, &selected, 1);
         let datas1: Vec<&str> = all_buttons(&p1).map(data).collect();
         assert!(datas1.contains(&"f:models_page:0"), "◀ on page 1");
         assert!(datas1.contains(&"f:models_page:2"), "▶ on page 1");
@@ -639,7 +671,7 @@ mod tests {
         );
 
         // Out-of-range page clamps to the last, which has ◀ but no ▶.
-        let last = model_picker_keyboard(&models, &selected, 99);
+        let last = model_picker_keyboard(Lang::Ru, &models, &selected, 99);
         let datasl: Vec<&str> = all_buttons(&last).map(data).collect();
         assert!(
             datasl.contains(&"f:models_page:1"),
@@ -653,12 +685,12 @@ mod tests {
     fn single_page_pickers_have_no_nav_row() {
         // MINI's 6 models and a short brand list fit one page — no ◀/▶ clutter.
         let mini = owned(models_for_brand("mini").unwrap());
-        let kb = model_picker_keyboard(&mini, &[], 0);
+        let kb = model_picker_keyboard(Lang::Ru, &mini, &[], 0);
         assert!(
             !all_buttons(&kb).any(|b| data(b).starts_with(CB_FILTER_MODELS_PAGE_PREFIX)),
             "no model nav row for a single page"
         );
-        let kb = brand_picker_keyboard(&owned(&[("audi", "Audi"), ("bmw", "BMW")]), 0);
+        let kb = brand_picker_keyboard(Lang::Ru, &owned(&[("audi", "Audi"), ("bmw", "BMW")]), 0);
         assert!(
             !all_buttons(&kb).any(|b| data(b).starts_with(CB_FILTER_BRAND_PAGE_PREFIX)),
             "no brand nav row for a single page"
@@ -670,13 +702,13 @@ mod tests {
         // Every picker opened from the top menu must offer a direct way back
         // to it (#6) — for the confirmation screen that's the Cancel button.
         let keyboards = [
-            brand_picker_keyboard(&brands(), 0),
-            chassis_picker_keyboard(&[]),
-            gearbox_picker_keyboard(&[]),
-            interval_picker_keyboard(600),
-            reset_confirm_keyboard(),
-            range_picker_keyboard("price", PRICE_RANGES, (None, None)),
-            range_picker_keyboard("year", YEAR_RANGES, (None, None)),
+            brand_picker_keyboard(Lang::Ru, &brands(), 0),
+            chassis_picker_keyboard(Lang::Ru, &[]),
+            gearbox_picker_keyboard(Lang::Ru, &[]),
+            interval_picker_keyboard(Lang::Ru, 600),
+            reset_confirm_keyboard(Lang::Ru),
+            range_picker_keyboard(Lang::Ru, "price", PRICE_RANGES, (None, None)),
+            range_picker_keyboard(Lang::Ru, "year", YEAR_RANGES, (None, None)),
         ];
         for kb in &keyboards {
             assert!(
@@ -695,7 +727,7 @@ mod tests {
         let total_pages = brands.len().div_ceil(BRANDS_PER_PAGE).max(1);
         let mut slugs: Vec<String> = Vec::new();
         for page in 0..total_pages {
-            let kb = brand_picker_keyboard(&brands, page);
+            let kb = brand_picker_keyboard(Lang::Ru, &brands, page);
             for b in all_buttons(&kb) {
                 if let Some(slug) = data(b).strip_prefix(CB_FILTER_BRAND_SET_PREFIX) {
                     slugs.push(slug.to_string());

@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
     info!(
         poll_interval_secs = runtime_initial.poll_interval.as_secs(),
         paused = runtime_initial.paused,
+        lang = runtime_initial.lang.as_code(),
         brand = ?runtime_initial.search.brand,
         models = ?runtime_initial.search.models,
         chassis = ?runtime_initial.search.chassis,
