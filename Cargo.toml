@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["full"] }
 scraper = "0.27"
 
 # SQLite. "bundled" compiles SQLite from source — no system libsqlite3 required.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Logging / tracing.
 # `tracing` is the facade; `tracing-subscriber` is the actual collector/formatter.
