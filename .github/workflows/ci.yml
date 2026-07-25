@@ -31,7 +31,7 @@ jobs:
     name: fmt · clippy · test · build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # `dtolnay/rust-toolchain` is the de facto Rust toolchain action — small,
       # well-maintained, no Docker. Pinning to `stable` so the bot doesn't
@@ -72,7 +72,7 @@ jobs:
       contents: read
       issues: write # the action files an issue for advisories on scheduled runs
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
