@@ -11,6 +11,12 @@ Releases come from tag pushes (`v*`) — see [README → Cutting a release](READ
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [0.2.0] — 2026-07-27
+
 ### Added
 
 - Dynamic brand/model catalog wired into the `/filter` wizard (#11). The brand and model pickers now render from the site's real dropdowns (fetched through the same curl/CF-proxy path as the scraper, cached in SQLite with a weekly TTL), instead of a hardcoded list of "educated-guess" model slugs. Both pickers **paginate** — a shared `paginate` helper cuts long lists into pages with a `◀ N/M ▶` nav row, so the ~80-brand site list and long model lists (VW, Mercedes) stay usable. Rendering is instant: the picker reads the cache (or the hardcoded fallback, so it never blanks) and freshens it in a **background** task, so a tap never waits on the network. `/setbrand` is demoted to a rarely-needed fallback now that the picker covers the full catalog.
