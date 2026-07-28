@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{debug, info};
 
-use crate::models::Listing;
+use crate::models::{Listing, SearchFilter};
 
 /// Schema migrations. Each entry runs once, in order, via `execute_batch`.
 /// Adding a new column: append a new `ALTER TABLE …` statement here — never
@@ -72,6 +72,30 @@ const MIGRATIONS: &[&str] = &[
         fetched_at  TEXT NOT NULL DEFAULT (datetime('now')),
         PRIMARY KEY (kind, brand_slug, item_slug)
     );",
+    // v4: named filter sets (#10, stage 1 of 3).
+    //   * `filters` — one row per saved filter; the filter itself is a JSON
+    //     blob (see `SearchFilter` serde note) so fields evolve without
+    //     migrations. `name` is UNIQUE: the /filter wizard will address
+    //     filters by name, and two filters named "bmw" is user error.
+    //   * `seen_by_filter` — filter-scoped dedup: a listing can be new for
+    //     filter B even when already seen for filter A. Listing *details*
+    //     stay in `seen_listings` (one place); this table only links.
+    //     ON DELETE CASCADE keeps it consistent when a filter is removed
+    //     (needs `PRAGMA foreign_keys=ON`, set per-connection in `new`).
+    "CREATE TABLE IF NOT EXISTS filters (
+        id          INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        filter_json TEXT NOT NULL,
+        enabled     INTEGER NOT NULL DEFAULT 1,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS seen_by_filter (
+        filter_id   INTEGER NOT NULL REFERENCES filters(id) ON DELETE CASCADE,
+        listing_id  INTEGER NOT NULL,
+        first_seen  TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (filter_id, listing_id)
+    );",
 ];
 
 /// `catalog.kind` value for brand rows. Brand rows always carry `brand_slug=''`
@@ -108,6 +132,13 @@ impl Storage {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening SQLite at {}", path.display()))?;
+
+        // SQLite ships with foreign keys OFF for backwards compatibility, and
+        // the setting is per-connection, not persisted in the file. We rely on
+        // `ON DELETE CASCADE` (seen_by_filter → filters), so turn it on before
+        // anything else touches the connection.
+        conn.pragma_update(None, "foreign_keys", true)
+            .context("enabling foreign_keys pragma")?;
 
         for sql in MIGRATIONS {
             conn.execute_batch(sql)
@@ -471,6 +502,215 @@ impl Storage {
             .context("checking catalog freshness")?;
         Ok(n > 0)
     }
+
+    // --- Named filter sets (#10, stage 1: schema + storage API) ---
+    //
+    // Stage 1 only touches this module: the poll loop still runs the single
+    // `RuntimeConfig.search` filter, and the /filter wizard doesn't know
+    // about named sets yet. Stages 2 (loop over N filters) and 3 (wizard UI)
+    // build on this API without further schema work.
+
+    /// Creates a named filter. Returns the new row id.
+    ///
+    /// The filter travels as one JSON blob (`serde_json`), not per-field
+    /// columns — filter fields evolve in `models.rs` without a migration.
+    /// A duplicate name surfaces as an error (UNIQUE constraint): callers
+    /// present it as "that name is taken", they don't silently overwrite.
+    pub fn create_filter(&self, name: &str, filter: &SearchFilter) -> Result<i64> {
+        let json = serde_json::to_string(filter).context("serialising filter")?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO filters (name, filter_json) VALUES (?1, ?2)",
+            params![name, json],
+        )
+        .with_context(|| format!("creating filter {name:?}"))?;
+        let id = conn.last_insert_rowid();
+        info!(id, name, "filter created");
+        Ok(id)
+    }
+
+    /// All saved filters, oldest first (stable order for pickers and logs).
+    pub fn list_filters(&self) -> Result<Vec<SavedFilter>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached("SELECT id, name, filter_json, enabled FROM filters ORDER BY id")
+            .context("preparing list_filters")?;
+        // Two-phase: pull raw rows out of rusqlite first, then parse JSON with
+        // serde. Mixing the two inside `query_map` would force squeezing a
+        // serde error into `rusqlite::Error`; splitting keeps both `?`-clean.
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
+            })
+            .context("executing list_filters")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collecting filter rows")?;
+        rows.into_iter()
+            .map(|(id, name, json, enabled)| {
+                let filter = serde_json::from_str(&json)
+                    .with_context(|| format!("parsing filter {id} ({name:?})"))?;
+                Ok(SavedFilter {
+                    id,
+                    name,
+                    filter,
+                    enabled,
+                })
+            })
+            .collect()
+    }
+
+    /// Replaces the filter payload of an existing row. Returns `false` when
+    /// the id doesn't exist (caller decides whether that's an error).
+    pub fn update_filter(&self, id: i64, filter: &SearchFilter) -> Result<bool> {
+        let json = serde_json::to_string(filter).context("serialising filter")?;
+        let changes = self
+            .conn()
+            .execute(
+                "UPDATE filters SET filter_json = ?2, updated_at = datetime('now')
+                 WHERE id = ?1",
+                params![id, json],
+            )
+            .with_context(|| format!("updating filter {id}"))?;
+        Ok(changes > 0)
+    }
+
+    /// Renames a filter. Same UNIQUE-name semantics as [`create_filter`].
+    pub fn rename_filter(&self, id: i64, name: &str) -> Result<bool> {
+        let changes = self
+            .conn()
+            .execute(
+                "UPDATE filters SET name = ?2, updated_at = datetime('now')
+                 WHERE id = ?1",
+                params![id, name],
+            )
+            .with_context(|| format!("renaming filter {id}"))?;
+        Ok(changes > 0)
+    }
+
+    /// Enables/disables a filter without deleting its dedup history —
+    /// re-enabling later must not re-notify everything the filter saw before.
+    pub fn set_filter_enabled(&self, id: i64, enabled: bool) -> Result<bool> {
+        let changes = self
+            .conn()
+            .execute(
+                "UPDATE filters SET enabled = ?2, updated_at = datetime('now')
+                 WHERE id = ?1",
+                params![id, enabled],
+            )
+            .with_context(|| format!("toggling filter {id}"))?;
+        Ok(changes > 0)
+    }
+
+    /// Deletes a filter; its `seen_by_filter` rows go with it (FK cascade).
+    /// Listing details in `seen_listings` stay — other filters may link them.
+    pub fn delete_filter(&self, id: i64) -> Result<bool> {
+        let changes = self
+            .conn()
+            .execute("DELETE FROM filters WHERE id = ?1", params![id])
+            .with_context(|| format!("deleting filter {id}"))?;
+        Ok(changes > 0)
+    }
+
+    /// Filter-scoped twin of [`unseen`]: which of `batch` has *this filter*
+    /// not seen yet. The same listing can be unseen for filter B while long
+    /// known to filter A — that's the whole point of #10.
+    pub fn unseen_for_filter(&self, filter_id: i64, batch: &[Listing]) -> Result<Vec<Listing>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached("SELECT 1 FROM seen_by_filter WHERE filter_id = ?1 AND listing_id = ?2")
+            .context("preparing unseen_for_filter lookup")?;
+        let mut result = Vec::with_capacity(batch.len());
+        for l in batch {
+            let exists: Option<i64> = stmt
+                .query_row(params![filter_id, l.id as i64], |r| r.get(0))
+                .optional()
+                .with_context(|| format!("checking listing {} for filter {filter_id}", l.id))?;
+            if exists.is_none() {
+                result.push(l.clone());
+            }
+        }
+        debug!(
+            filter_id,
+            batch = batch.len(),
+            unseen = result.len(),
+            "filter-scoped unseen lookup done"
+        );
+        Ok(result)
+    }
+
+    /// Filter-scoped twin of [`mark_seen`]: links `listings` to `filter_id`
+    /// and upserts their details into `seen_listings` in the same transaction
+    /// (details live in one place; the link table only links). Idempotent on
+    /// both tables, and keeps mark-after-send semantics — call it only once
+    /// the notification actually went out.
+    pub fn mark_seen_for_filter(&self, filter_id: i64, listings: &[Listing]) -> Result<()> {
+        if listings.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn();
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting mark_seen_for_filter transaction")?;
+        {
+            let mut details = tx
+                .prepare_cached(
+                    "INSERT INTO seen_listings
+                        (id, title, url, price_text, city, year, mileage_km)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(id) DO NOTHING",
+                )
+                .context("preparing details upsert")?;
+            let mut link = tx
+                .prepare_cached(
+                    "INSERT INTO seen_by_filter (filter_id, listing_id)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(filter_id, listing_id) DO NOTHING",
+                )
+                .context("preparing link insert")?;
+            for l in listings {
+                details
+                    .execute(params![
+                        l.id as i64,
+                        l.title,
+                        l.url,
+                        l.price_text,
+                        l.city,
+                        l.year,
+                        l.mileage_km,
+                    ])
+                    .with_context(|| format!("upserting listing {}", l.id))?;
+                link.execute(params![filter_id, l.id as i64])
+                    .with_context(|| format!("linking listing {} to filter {filter_id}", l.id))?;
+            }
+        }
+        tx.commit()
+            .context("committing mark_seen_for_filter transaction")?;
+        debug!(
+            filter_id,
+            count = listings.len(),
+            "mark_seen_for_filter done"
+        );
+        Ok(())
+    }
+}
+
+/// One saved row of the `filters` table (#10), with the payload already
+/// deserialised. Plain data carrier: no behaviour, so the wizard (stage 3)
+/// and the poll loop (stage 2) can shuttle it around freely.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedFilter {
+    pub id: i64,
+    pub name: String,
+    pub filter: SearchFilter,
+    pub enabled: bool,
 }
 
 #[cfg(test)]
@@ -715,6 +955,107 @@ mod tests {
         let u = s.unseen(&[listing(100, "P")]).unwrap();
         assert!(u.is_empty());
         assert_eq!(s.seen_count().unwrap(), 1);
+    }
+
+    // --- Named filter sets (#10, stage 1) ---
+
+    fn bmw_filter() -> SearchFilter {
+        SearchFilter {
+            brand: Some("bmw".into()),
+            price_to: Some(8000),
+            year_to: Some(2018),
+            ..SearchFilter::default()
+        }
+    }
+
+    #[test]
+    fn filter_crud_round_trips_losslessly() {
+        let (s, _dir) = temp_storage();
+        let id = s.create_filter("bmw-3", &bmw_filter()).unwrap();
+
+        let all = s.list_filters().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, id);
+        assert_eq!(all[0].name, "bmw-3");
+        assert!(all[0].enabled, "new filters start enabled");
+        assert_eq!(all[0].filter, bmw_filter(), "JSON round-trip is lossless");
+
+        // Rename + payload update + disable, each observable via list.
+        assert!(s.rename_filter(id, "bmw-cheap").unwrap());
+        let updated = SearchFilter {
+            price_to: Some(5000),
+            ..bmw_filter()
+        };
+        assert!(s.update_filter(id, &updated).unwrap());
+        assert!(s.set_filter_enabled(id, false).unwrap());
+        let row = &s.list_filters().unwrap()[0];
+        assert_eq!(row.name, "bmw-cheap");
+        assert_eq!(row.filter.price_to, Some(5000));
+        assert!(!row.enabled);
+
+        // Operations on a ghost id report "nothing changed", not an error.
+        assert!(!s.rename_filter(999, "x").unwrap());
+        assert!(!s.update_filter(999, &bmw_filter()).unwrap());
+        assert!(!s.set_filter_enabled(999, true).unwrap());
+        assert!(!s.delete_filter(999).unwrap());
+    }
+
+    #[test]
+    fn duplicate_filter_name_is_rejected() {
+        let (s, _dir) = temp_storage();
+        s.create_filter("bmw", &bmw_filter()).unwrap();
+        assert!(
+            s.create_filter("bmw", &SearchFilter::default()).is_err(),
+            "UNIQUE(name) must reject the duplicate"
+        );
+    }
+
+    #[test]
+    fn dedup_is_scoped_per_filter() {
+        let (s, _dir) = temp_storage();
+        let a = s.create_filter("a", &SearchFilter::default()).unwrap();
+        let b = s.create_filter("b", &SearchFilter::default()).unwrap();
+        let batch = vec![listing(1, "L1"), listing(2, "L2")];
+
+        // Filter A sees both; the same listings are still new for filter B.
+        s.mark_seen_for_filter(a, &batch).unwrap();
+        assert!(s.unseen_for_filter(a, &batch).unwrap().is_empty());
+        assert_eq!(s.unseen_for_filter(b, &batch).unwrap().len(), 2);
+
+        // B catches up; both are now fully seen. Details land once.
+        s.mark_seen_for_filter(b, &batch).unwrap();
+        assert!(s.unseen_for_filter(b, &batch).unwrap().is_empty());
+        assert_eq!(
+            s.seen_count().unwrap(),
+            2,
+            "details stored once, not per filter"
+        );
+
+        // Marking twice is idempotent, same as mark_seen.
+        s.mark_seen_for_filter(a, &batch).unwrap();
+        assert_eq!(s.seen_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn deleting_a_filter_cascades_links_but_keeps_details() {
+        let (s, _dir) = temp_storage();
+        let a = s.create_filter("a", &SearchFilter::default()).unwrap();
+        let b = s.create_filter("b", &SearchFilter::default()).unwrap();
+        let batch = vec![listing(1, "L1")];
+        s.mark_seen_for_filter(a, &batch).unwrap();
+        s.mark_seen_for_filter(b, &batch).unwrap();
+
+        assert!(s.delete_filter(a).unwrap());
+        // A's history is gone with it: the listing would be "new" again for a
+        // recreated filter A (fresh id), while B's memory is untouched.
+        let a2 = s.create_filter("a", &SearchFilter::default()).unwrap();
+        assert_eq!(s.unseen_for_filter(a2, &batch).unwrap().len(), 1);
+        assert!(s.unseen_for_filter(b, &batch).unwrap().is_empty());
+        assert_eq!(
+            s.seen_count().unwrap(),
+            1,
+            "shared details survive the cascade"
+        );
     }
 
     fn pair(a: &str, b: &str) -> (String, String) {

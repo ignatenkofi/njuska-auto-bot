@@ -70,7 +70,7 @@ exceeds ~300 lines or splits naturally — `commands/` already has, per #24):
 - `config.rs` — env -> `StaticConfig` (fixed) + `RuntimeConfig` (env defaults merged with DB overrides) + `ProxyConfig`.
 - `models.rs` — `Listing`, `SearchFilter`, `ShowOldNew`, shared types.
 - `scraper.rs` — curl shell-out (optional CF Worker proxy) + HTML parse via CSS selectors.
-- `storage.rs` — SQLite via `rusqlite` (`seen_listings` dedup + `runtime_settings`).
+- `storage.rs` — SQLite via `rusqlite` (`seen_listings` dedup + `runtime_settings` + named `filters` with filter-scoped dedup, #10 stage 1).
 - `telegram.rs` — teloxide-based send-only client + HTML escaping.
 - `commands/` — teloxide command dispatcher: `mod.rs` (routing/auth, `Command`, `CommandContext`), `catalog.rs` (brand/model/body-type data), `handlers.rs` (per-command handlers + `apply_*` + formatters), `keyboards.rs` (inline keyboards + callback-data constants).
 - `signals.rs` — shared SIGINT/SIGTERM future + internal `request_shutdown` path.
