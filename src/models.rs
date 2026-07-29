@@ -48,7 +48,9 @@ pub struct Listing {
 /// `#[derive(Default)]` together with `#[default]` on a variant gives us
 /// `ShowOldNew::default() == All` for free — handy when building filters
 /// piecemeal from `.env` where the user might omit the option entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `Serialize` / `Deserialize`: saved filters (#10) persist as JSON in the
+/// `filters` table, and this enum rides inside `SearchFilter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ShowOldNew {
     #[default]
     All,
@@ -79,7 +81,11 @@ impl ShowOldNew {
 /// `#[derive(Default)]` gives `SearchFilter::default()` with `None`s and empty
 /// `Vec`s — the equivalent of "no filters at all" — which is convenient for
 /// tests and for `..` struct-update syntax in builder-ish code.
-#[derive(Debug, Clone, Default)]
+/// `Serialize` / `Deserialize`: named filter sets (#10) are stored as one
+/// JSON blob per row — the schema doesn't chase per-field columns, so filter
+/// fields can evolve without a migration. `PartialEq` is for tests
+/// (round-trip through storage must be lossless).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SearchFilter {
     pub brand: Option<String>,
     /// PHP-style array param: each entry becomes `model[]=<value>` in the URL.
