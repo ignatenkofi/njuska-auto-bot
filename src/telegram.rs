@@ -180,6 +180,20 @@ pub fn format_listing_html(l: &Listing) -> String {
     lines.join("\n")
 }
 
+/// [`format_listing_html`] plus a trailing `[filter-name]` tag (#10, stage 2).
+///
+/// A footer rather than a prefix: the listing card stays scannable, the tag
+/// answers "which of my filters matched this?". Bracketed name instead of a
+/// localized "filter:" label keeps the formatter out of i18n. The name is
+/// user input (the /filter wizard, stage 3) — escaped like everything else.
+pub fn format_listing_html_tagged(l: &Listing, filter_name: &str) -> String {
+    format!(
+        "{}\n<i>[{}]</i>",
+        format_listing_html(l),
+        escape_html(filter_name)
+    )
+}
+
 /// Escapes the three characters Telegram's HTML parser treats specially in
 /// element *content*: `&`, `<`, `>`.
 ///
@@ -329,6 +343,17 @@ mod tests {
         assert!(html.contains("144857 km"), "{html}");
         assert!(html.contains("Kovin"), "{html}");
         assert!(html.contains(" · "), "{html}");
+    }
+
+    #[test]
+    fn format_listing_html_tagged_appends_escaped_filter_name() {
+        let html = format_listing_html_tagged(&sample_listing(), "bmw <3 & co");
+        // The card itself is unchanged, the tag is a separate last line.
+        assert!(html.contains(">MINI Cooper 1.6d CaBRiO</a></b>"), "{html}");
+        assert!(
+            html.ends_with("<i>[bmw &lt;3 &amp; co]</i>"),
+            "tag must be the escaped last line: {html}"
+        );
     }
 
     #[test]

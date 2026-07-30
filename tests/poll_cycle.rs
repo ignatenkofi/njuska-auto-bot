@@ -389,6 +389,207 @@ async fn zero_listings_across_all_pages_counts_as_one_zero_cycle() {
     assert!(sent[0].contains("0 listings"), "{}", sent[0]);
 }
 
+// --- Saved filters (#10, stage 2) ------------------------------------------
+//
+// Everything above runs with an empty `filters` table — the legacy
+// single-filter path. These tests populate the table via the stage-1 storage
+// API (the /filter wizard is stage 3) and assert the multi-filter cycle:
+// per-filter fetch, per-filter dedup scope, [name]-tagged messages.
+
+#[tokio::test(start_paused = true)]
+async fn saved_filters_each_poll_with_scoped_dedup_and_tagged_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let static_cfg = test_static_cfg(dir.path());
+    let runtime = test_runtime();
+    let storage = Storage::new(&static_cfg.database_path).unwrap();
+    let mut state = LoopState::default();
+
+    storage
+        .create_filter("bmw-cabrio", &SearchFilter::default())
+        .unwrap();
+    storage
+        .create_filter("cheap-kombi", &SearchFilter::default())
+        .unwrap();
+
+    // Cycle 1: both filters see the same 14-listing page; each must get all
+    // of them in its own scope — 28 sends, every message tagged.
+    let collector = Collector::new();
+    bot::run_one_cycle(
+        &static_cfg,
+        &runtime,
+        &storage,
+        &collector,
+        &mut state,
+        &fixture_fetch,
+    )
+    .await
+    .unwrap();
+
+    let sent = collector.sent();
+    assert_eq!(sent.len(), 2 * FIXTURE_LISTINGS, "14 per filter");
+    let bmw = sent.iter().filter(|m| m.contains("[bmw-cabrio]")).count();
+    let kombi = sent.iter().filter(|m| m.contains("[cheap-kombi]")).count();
+    assert_eq!(bmw, FIXTURE_LISTINGS, "every bmw send carries its tag");
+    assert_eq!(kombi, FIXTURE_LISTINGS, "every kombi send carries its tag");
+
+    // Listing *details* are stored once; only the per-filter links differ.
+    assert_eq!(storage.seen_count().unwrap(), FIXTURE_LISTINGS as u64);
+
+    // Cycle 2: both scopes know everything — silence.
+    let collector2 = Collector::new();
+    bot::run_one_cycle(
+        &static_cfg,
+        &runtime,
+        &storage,
+        &collector2,
+        &mut state,
+        &fixture_fetch,
+    )
+    .await
+    .unwrap();
+    assert!(
+        collector2.sent().is_empty(),
+        "second cycle must send nothing"
+    );
+}
+
+#[tokio::test]
+async fn disabled_saved_filter_is_not_polled() {
+    let dir = tempfile::tempdir().unwrap();
+    let static_cfg = test_static_cfg(dir.path());
+    let runtime = test_runtime();
+    let storage = Storage::new(&static_cfg.database_path).unwrap();
+    let mut state = LoopState::default();
+
+    storage
+        .create_filter("active-one", &SearchFilter::default())
+        .unwrap();
+    let dormant = storage
+        .create_filter("dormant-one", &SearchFilter::default())
+        .unwrap();
+    storage.set_filter_enabled(dormant, false).unwrap();
+
+    let fetches = Arc::new(Mutex::new(0u32));
+    let fetch = {
+        let fetches = fetches.clone();
+        move |_f: SearchFilter, _page: u32| {
+            *fetches.lock().unwrap() += 1;
+            std::future::ready(Ok::<String, ScraperError>(FIXTURE.to_string()))
+        }
+    };
+
+    let collector = Collector::new();
+    bot::run_one_cycle(
+        &static_cfg,
+        &runtime,
+        &storage,
+        &collector,
+        &mut state,
+        &fetch,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        1,
+        "only the enabled filter fetches"
+    );
+    let sent = collector.sent();
+    assert_eq!(sent.len(), FIXTURE_LISTINGS);
+    assert!(
+        sent.iter().all(|m| m.contains("[active-one]")),
+        "all sends belong to the enabled filter"
+    );
+}
+
+#[tokio::test]
+async fn all_saved_filters_disabled_polls_nothing_and_skips_the_zero_streak() {
+    let dir = tempfile::tempdir().unwrap();
+    let static_cfg = test_static_cfg(dir.path()); // threshold: 3
+    let runtime = test_runtime();
+    let storage = Storage::new(&static_cfg.database_path).unwrap();
+    let mut state = LoopState::default();
+
+    let id = storage
+        .create_filter("switched-off", &SearchFilter::default())
+        .unwrap();
+    storage.set_filter_enabled(id, false).unwrap();
+
+    // Same stance as the paused test: the cycle must not even try to fetch,
+    // and three no-op cycles must NOT accumulate a zero-streak alert — an
+    // intentionally silenced bot is not a broken parser.
+    let must_not_fetch = |_f: SearchFilter, _page: u32| async {
+        panic!("disabled-only cycle must not fetch");
+        #[allow(unreachable_code)]
+        Ok::<String, ScraperError>(String::new())
+    };
+
+    let collector = Collector::new();
+    for _ in 0..3 {
+        bot::run_one_cycle(
+            &static_cfg,
+            &runtime,
+            &storage,
+            &collector,
+            &mut state,
+            &must_not_fetch,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(collector.sent().is_empty(), "no listings and no alert");
+    assert_eq!(storage.seen_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn page1_fetch_failure_aborts_the_remaining_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let static_cfg = test_static_cfg(dir.path());
+    let runtime = test_runtime();
+    let storage = Storage::new(&static_cfg.database_path).unwrap();
+    let mut state = LoopState::default();
+
+    storage
+        .create_filter("first", &SearchFilter::default())
+        .unwrap();
+    storage
+        .create_filter("second", &SearchFilter::default())
+        .unwrap();
+
+    // The site is down: if filter one can't fetch page 1, polling filter two
+    // would just hammer the same dead host — the cycle must stop after one
+    // attempt.
+    let fetches = Arc::new(Mutex::new(0u32));
+    let fetch = {
+        let fetches = fetches.clone();
+        move |_f: SearchFilter, _page: u32| {
+            *fetches.lock().unwrap() += 1;
+            std::future::ready(Err::<String, ScraperError>(ScraperError::Status(500)))
+        }
+    };
+
+    let collector = Collector::new();
+    bot::run_one_cycle(
+        &static_cfg,
+        &runtime,
+        &storage,
+        &collector,
+        &mut state,
+        &fetch,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        1,
+        "the cycle must abort after the first page-1 failure"
+    );
+    assert!(collector.sent().is_empty());
+}
+
 #[tokio::test]
 async fn paused_cycle_fetches_and_sends_nothing() {
     let dir = tempfile::tempdir().unwrap();
