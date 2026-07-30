@@ -24,9 +24,10 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{RuntimeConfig, StaticConfig};
+use crate::models::{Listing, SearchFilter};
 use crate::scraper;
 use crate::signals::shutdown_signal;
-use crate::storage::Storage;
+use crate::storage::{SavedFilter, Storage};
 use crate::telegram::{self, Notifier, TelegramClient, TelegramError};
 
 /// Pause between same-cycle page fetches (#25): deeper pages are extra load
@@ -54,6 +55,56 @@ pub struct LoopState {
     /// happens once per calendar day regardless of poll cadence (#17).
     /// `None` on startup — the first cycle always runs maintenance.
     last_maintenance: Option<NaiveDate>,
+}
+
+/// One thing a cycle polls (#10, stage 2).
+///
+/// The legacy target keeps the pre-#10 bot byte-for-byte: until the /filter
+/// wizard (stage 3) ships nobody can create `filters` rows, so an empty
+/// table must mean "exactly yesterday's behavior". An enum with two
+/// data-carrying variants (rather than an `Option<i64>` threaded around)
+/// lets `match` force every call site to handle both dedup scopes — the
+/// compiler, not review, guards against mixing them up.
+enum PollTarget {
+    /// `RuntimeConfig.search` with the global `seen_listings` dedup.
+    Legacy(SearchFilter),
+    /// A `filters` row: filter-scoped dedup, `[name]`-tagged messages.
+    Saved(SavedFilter),
+}
+
+impl PollTarget {
+    fn search(&self) -> &SearchFilter {
+        match self {
+            PollTarget::Legacy(f) => f,
+            PollTarget::Saved(s) => &s.filter,
+        }
+    }
+
+    /// Saved-filter name for message tags; the legacy target has none.
+    fn name(&self) -> Option<&str> {
+        match self {
+            PollTarget::Legacy(_) => None,
+            PollTarget::Saved(s) => Some(s.name.as_str()),
+        }
+    }
+
+    /// Marker for dump filenames; `None` keeps the legacy layout.
+    fn dump_id(&self) -> Option<i64> {
+        match self {
+            PollTarget::Legacy(_) => None,
+            PollTarget::Saved(s) => Some(s.id),
+        }
+    }
+}
+
+/// What [`poll_one_target`] reports back to the cycle loop.
+enum TargetOutcome {
+    /// All pages processed; `parsed` feeds the cycle-level zero-streak.
+    Completed { parsed: usize },
+    /// The page-1 fetch failed: the site (or proxy) is unreachable and the
+    /// fetch-error streak is already updated. Polling the remaining targets
+    /// would hammer a host that just refused us — the cycle stops here.
+    FetchAborted,
 }
 
 /// The main entrypoint. Returns when Ctrl+C / SIGTERM is received (or never,
@@ -197,106 +248,44 @@ where
         return Ok(());
     }
 
-    // --- Fetch pages, newest first, until nothing new shows up (#25) ---
-    //
-    // The pagination loop lives here rather than in `scraper` on purpose:
-    // the early-stop rule needs storage ("does this page still contain
-    // unseen ids?"), and pushing that into the scraper would couple it to
-    // the database. This function already owns both halves, so it composes
-    // them; the scraper stays a fetch-one-page + parse-pure pair.
-    let max_pages = static_cfg.max_search_pages.max(1);
-    let mut total_parsed = 0usize;
-    let mut unseen: Vec<crate::models::Listing> = Vec::new();
-    // Promoted ads repeat at the top of every page — remember ids already
-    // collected this cycle so a repeat can't be sent twice.
-    let mut cycle_ids: HashSet<u64> = HashSet::new();
+    // Which filters this cycle polls (#10, stage 2). An empty `filters`
+    // table means the pre-#10 single-filter bot: `RuntimeConfig.search`
+    // against the global dedup. A non-empty table takes over completely —
+    // enabled rows only, each in its own dedup scope. Deliberately no mixed
+    // mode: mixing the global and per-filter seen-sets in one cycle would
+    // make "why did/didn't it notify?" unanswerable.
+    let saved = storage.list_filters().context("loading saved filters")?;
+    let targets: Vec<PollTarget> = if saved.is_empty() {
+        vec![PollTarget::Legacy(search)]
+    } else {
+        saved
+            .into_iter()
+            .filter(|f| f.enabled)
+            .map(PollTarget::Saved)
+            .collect()
+    };
+    if targets.is_empty() {
+        // Every saved filter is disabled — an explicit user choice, not a
+        // parser problem: nothing is fetched and the zero-streak stays put,
+        // same stance as `paused`.
+        debug!("all saved filters disabled; nothing to poll");
+        return Ok(());
+    }
 
-    for page in 1..=max_pages {
-        if page > 1 {
+    let mut total_parsed = 0usize;
+    for (i, target) in targets.iter().enumerate() {
+        if i > 0 {
+            // Same politeness pause between filters as between pages — from
+            // the site's side both are just "one more request from us".
             tokio::time::sleep(PAGE_FETCH_DELAY).await;
         }
-
-        let html = match fetch(search.clone(), page).await {
-            Ok(h) => {
-                // Fetch works again — clear the error streak and re-arm the alert.
-                update_fetch_error_streak(state, false, static_cfg.fetch_errors_alert_threshold);
-                h
-            }
-            Err(e) if page > 1 => {
-                // A deeper-page failure loses only the tail of this cycle —
-                // process what earlier pages already gave us instead of
-                // discarding them. The fetch-error streak stays untouched:
-                // it answers "can we reach the site at all?", and page 1
-                // just proved we can.
-                warn!(error = %e, page, "page fetch failed; stopping pagination this cycle");
-                break;
-            }
-            Err(e) => {
-                // Fetch failures are usually transient (network blip) so they're
-                // kept out of the zero-streak/parser detector. But a *persistent*
-                // fetch failure (dead proxy, rotated CF_PROXY_SECRET, CF blocking
-                // us) won't fix itself either — that gets its own streak counter
-                // and a one-off Telegram alert per streak (#12).
-                warn!(
-                    error = %e,
-                    streak = state.fetch_error_streak + 1,
-                    "fetch failed; will retry next cycle"
-                );
-                if update_fetch_error_streak(state, true, static_cfg.fetch_errors_alert_threshold) {
-                    let alert = format!(
-                        "⚠️ <b>NjuskaAutoBot alert</b>\n\n\
-                         Fetching the search page failed <b>{}</b> times in a row.\n\
-                         Last error: {}",
-                        state.fetch_error_streak,
-                        telegram::escape_html(&describe_fetch_error(
-                            &e,
-                            static_cfg.cf_proxy.is_some()
-                        )),
-                    );
-                    if let Err(send_err) = notifier.send_html(&alert).await {
-                        warn!(error = %send_err, "couldn't send fetch-error alert");
-                    } else {
-                        state.fetch_error_alerted = true;
-                    }
-                }
-                return Ok(());
-            }
-        };
-
-        if static_cfg.save_raw_html
-            && let Err(e) = save_html_dump(&static_cfg.dumps_dir, &html, page).await
-        {
-            // Dump-on-disk is a debugging convenience; failing to write to disk
-            // shouldn't fail the bot. Log and carry on.
-            warn!(error = %e, "couldn't write HTML dump");
-        }
-
-        let listings = scraper::parse_listings(&html);
-        debug!(page, parsed = listings.len(), "page parsed");
-        total_parsed += listings.len();
-        if listings.is_empty() {
-            // Either past the last page of results, or the site changed under
-            // us — the zero-streak detector below judges that on the total.
-            break;
-        }
-
-        let fresh: Vec<crate::models::Listing> = listings
-            .into_iter()
-            .filter(|l| cycle_ids.insert(l.id))
-            .collect();
-        let page_unseen = storage.unseen(&fresh).context("dedup")?;
-        let page_exhausted = page_unseen.is_empty();
-        unseen.extend(page_unseen);
-        if page_exhausted {
-            // Sort is pinned newest-first, so a page with nothing unseen means
-            // deeper pages are older still — nothing new lives past here. In
-            // steady state this fires on page 1: one request per cycle, the
-            // same traffic profile as before pagination existed.
-            break;
+        match poll_one_target(static_cfg, storage, notifier, state, fetch, target).await? {
+            TargetOutcome::Completed { parsed } => total_parsed += parsed,
+            TargetOutcome::FetchAborted => return Ok(()),
         }
     }
 
-    // Housekeeping once per cycle, after all pages are on disk.
+    // Housekeeping once per cycle, after all filters' pages are on disk.
     if static_cfg.save_raw_html {
         if static_cfg.dump_retention_days > 0
             && let Err(e) =
@@ -318,8 +307,9 @@ where
     }
 
     // Update the zero-streak state and *maybe* fire an alert. "Zero" means
-    // zero across ALL pages fetched this cycle — same "site probably changed"
-    // signal as in the single-page era.
+    // zero across ALL filters and pages this cycle — one narrow filter
+    // returning nothing is normal life, every filter returning nothing is
+    // the same "site probably changed" signal as in the single-filter era.
     if let Some(alert) = update_streak(
         state,
         total_parsed == 0,
@@ -331,26 +321,165 @@ where
             state.streak_alerted = true;
         }
     }
+    Ok(())
+}
+
+/// Polls one target: fetch pages → dump → parse → dedup (in the target's
+/// scope) → send → mark. This is the old single-filter cycle body, extracted
+/// so the multi-filter loop (#10, stage 2) stays readable; dedup and
+/// mark-seen dispatch on the target so the two scopes can't be mixed up.
+async fn poll_one_target<N, F, Fut>(
+    static_cfg: &StaticConfig,
+    storage: &Storage,
+    notifier: &N,
+    state: &mut LoopState,
+    fetch: &F,
+    target: &PollTarget,
+) -> Result<TargetOutcome>
+where
+    N: Notifier,
+    F: Fn(SearchFilter, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<String, scraper::ScraperError>>,
+{
+    // Tracing's `%field` wants a Display value and `Option<&str>` isn't one;
+    // a plain default keeps every log line greppable by filter.
+    let label = target.name().unwrap_or("config");
+
+    // --- Fetch pages, newest first, until nothing new shows up (#25) ---
+    //
+    // The pagination loop lives here rather than in `scraper` on purpose:
+    // the early-stop rule needs storage ("does this page still contain
+    // unseen ids?"), and pushing that into the scraper would couple it to
+    // the database. This function already owns both halves, so it composes
+    // them; the scraper stays a fetch-one-page + parse-pure pair.
+    let max_pages = static_cfg.max_search_pages.max(1);
+    let mut total_parsed = 0usize;
+    let mut unseen: Vec<Listing> = Vec::new();
+    // Promoted ads repeat at the top of every page — remember ids already
+    // collected for this target so a repeat can't be sent twice. Per-target,
+    // not per-cycle: the same listing genuinely goes to every filter it
+    // matches (that's the point of #10), only within one filter it's a dupe.
+    let mut cycle_ids: HashSet<u64> = HashSet::new();
+
+    for page in 1..=max_pages {
+        if page > 1 {
+            tokio::time::sleep(PAGE_FETCH_DELAY).await;
+        }
+
+        let html = match fetch(target.search().clone(), page).await {
+            Ok(h) => {
+                // Fetch works again — clear the error streak and re-arm the alert.
+                update_fetch_error_streak(state, false, static_cfg.fetch_errors_alert_threshold);
+                h
+            }
+            Err(e) if page > 1 => {
+                // A deeper-page failure loses only the tail of this target —
+                // process what earlier pages already gave us instead of
+                // discarding them. The fetch-error streak stays untouched:
+                // it answers "can we reach the site at all?", and page 1
+                // just proved we can.
+                warn!(error = %e, filter = %label, page, "page fetch failed; stopping pagination this cycle");
+                break;
+            }
+            Err(e) => {
+                // Fetch failures are usually transient (network blip) so they're
+                // kept out of the zero-streak/parser detector. But a *persistent*
+                // fetch failure (dead proxy, rotated CF_PROXY_SECRET, CF blocking
+                // us) won't fix itself either — that gets its own streak counter
+                // and a one-off Telegram alert per streak (#12).
+                warn!(
+                    error = %e,
+                    filter = %label,
+                    streak = state.fetch_error_streak + 1,
+                    "fetch failed; will retry next cycle"
+                );
+                if update_fetch_error_streak(state, true, static_cfg.fetch_errors_alert_threshold) {
+                    let alert = format!(
+                        "⚠️ <b>NjuskaAutoBot alert</b>\n\n\
+                         Fetching the search page failed <b>{}</b> times in a row.\n\
+                         Last error: {}",
+                        state.fetch_error_streak,
+                        telegram::escape_html(&describe_fetch_error(
+                            &e,
+                            static_cfg.cf_proxy.is_some()
+                        )),
+                    );
+                    if let Err(send_err) = notifier.send_html(&alert).await {
+                        warn!(error = %send_err, "couldn't send fetch-error alert");
+                    } else {
+                        state.fetch_error_alerted = true;
+                    }
+                }
+                return Ok(TargetOutcome::FetchAborted);
+            }
+        };
+
+        if static_cfg.save_raw_html
+            && let Err(e) =
+                save_html_dump(&static_cfg.dumps_dir, &html, page, target.dump_id()).await
+        {
+            // Dump-on-disk is a debugging convenience; failing to write to disk
+            // shouldn't fail the bot. Log and carry on.
+            warn!(error = %e, "couldn't write HTML dump");
+        }
+
+        let listings = scraper::parse_listings(&html);
+        debug!(filter = %label, page, parsed = listings.len(), "page parsed");
+        total_parsed += listings.len();
+        if listings.is_empty() {
+            // Either past the last page of results, or the site changed under
+            // us — the zero-streak detector in the caller judges the total.
+            break;
+        }
+
+        let fresh: Vec<Listing> = listings
+            .into_iter()
+            .filter(|l| cycle_ids.insert(l.id))
+            .collect();
+        let page_unseen = match target {
+            PollTarget::Legacy(_) => storage.unseen(&fresh).context("dedup")?,
+            PollTarget::Saved(f) => storage
+                .unseen_for_filter(f.id, &fresh)
+                .with_context(|| format!("filter-scoped dedup ({})", f.name))?,
+        };
+        let page_exhausted = page_unseen.is_empty();
+        unseen.extend(page_unseen);
+        if page_exhausted {
+            // Sort is pinned newest-first, so a page with nothing unseen means
+            // deeper pages are older still — nothing new lives past here. In
+            // steady state this fires on page 1: one request per filter, the
+            // same traffic profile as before pagination existed.
+            break;
+        }
+    }
 
     // Mark-after-send: `unseen` was identified read-only above; now send,
     // THEN persist only those that actually got through. A network failure
     // mid-batch leaves the unsent ones in the unseen set so the next cycle
     // picks them up. The previous "filter_new" (mark-then-send) lost them.
-    info!(total = total_parsed, unseen = unseen.len(), "cycle parsed");
+    info!(filter = %label, total = total_parsed, unseen = unseen.len(), "filter parsed");
 
-    let sent = send_batch(notifier, &unseen).await;
+    let sent = send_batch(notifier, &unseen, target.name()).await;
     let attempted = unseen.len();
     let sent_count = sent.len();
-    storage
-        .mark_seen(&sent)
-        .context("marking successfully-sent listings")?;
+    match target {
+        PollTarget::Legacy(_) => storage
+            .mark_seen(&sent)
+            .context("marking successfully-sent listings")?,
+        PollTarget::Saved(f) => storage
+            .mark_seen_for_filter(f.id, &sent)
+            .with_context(|| format!("marking sent listings for filter {}", f.name))?,
+    }
     info!(
+        filter = %label,
         attempted,
         sent = sent_count,
         failed = attempted - sent_count,
-        "cycle done"
+        "filter done"
     );
-    Ok(())
+    Ok(TargetOutcome::Completed {
+        parsed: total_parsed,
+    })
 }
 
 /// Pure function: mutates `state` and decides whether to fire an alert *now*.
@@ -469,17 +598,23 @@ pub(crate) fn describe_fetch_error(e: &scraper::ScraperError, via_proxy: bool) -
 ///   retried; the payload won't get better by resending it.
 async fn send_batch<N: Notifier>(
     notifier: &N,
-    listings: &[crate::models::Listing],
-) -> Vec<crate::models::Listing> {
+    listings: &[Listing],
+    filter_name: Option<&str>,
+) -> Vec<Listing> {
     /// Hard ceiling on how long we'll sleep waiting out a 429.
     const MAX_BACKOFF_SECS: u64 = 60;
     /// Fixed pause before retrying a transport-level failure.
     const RETRYABLE_BACKOFF_SECS: u64 = 3;
 
-    let mut sent: Vec<crate::models::Listing> = Vec::with_capacity(listings.len());
+    let mut sent: Vec<Listing> = Vec::with_capacity(listings.len());
 
     for l in listings {
-        let text = telegram::format_listing_html(l);
+        // Saved filters tag their messages so the user can tell which of
+        // their filters matched (#10); the legacy single filter stays untagged.
+        let text = match filter_name {
+            Some(name) => telegram::format_listing_html_tagged(l, name),
+            None => telegram::format_listing_html(l),
+        };
         match notifier.send_html(&text).await {
             Ok(()) => {
                 info!(id = l.id, title = %l.title, "sent");
@@ -545,20 +680,32 @@ async fn send_batch<N: Notifier>(
     sent
 }
 
-/// Writes one page's raw HTML under `<dumps_dir>/YYYY-MM-DD/HHMMSS-pN.html`.
-/// Creates intermediate directories if needed. Day-bucketed so daily
-/// rotation is trivial (drop yesterday's folder).
+/// Writes one page's raw HTML under
+/// `<dumps_dir>/YYYY-MM-DD/HHMMSS[-fID]-pN.html`. Creates intermediate
+/// directories if needed. Day-bucketed so daily rotation is trivial (drop
+/// yesterday's folder).
 ///
 /// The `-pN` suffix keeps a multi-page cycle from overwriting itself within
-/// one second and makes "which page broke the parser?" answerable from the
-/// filename. Lexicographic order still matches chronological order
-/// (`HHMMSS-p1` < `HHMMSS-p2` < next second), which the size-cap sweep's
-/// oldest-first sort relies on.
-async fn save_html_dump(dumps_dir: &Path, html: &str, page: u32) -> std::io::Result<()> {
+/// one second; the `-fID` segment (#10, stage 2) does the same for two
+/// filters fetching within the same second, and makes "which filter's page
+/// broke the parser?" answerable from the filename. Lexicographic order
+/// still matches chronological order across seconds (`HHMMSS-…` < next
+/// second), which the size-cap sweep's oldest-first sort relies on; within
+/// one second filter ids may sort out of fetch order — a sub-second slack
+/// the sweep doesn't care about.
+async fn save_html_dump(
+    dumps_dir: &Path,
+    html: &str,
+    page: u32,
+    filter_id: Option<i64>,
+) -> std::io::Result<()> {
     let now = Local::now();
     let day_dir = dumps_dir.join(now.format("%Y-%m-%d").to_string());
     tokio::fs::create_dir_all(&day_dir).await?;
-    let path = day_dir.join(format!("{}-p{page}.html", now.format("%H%M%S")));
+    // `map(...).unwrap_or_default()`: the `None` arm becomes "" — cheaper to
+    // read than an if/else building two format strings.
+    let tag = filter_id.map(|id| format!("-f{id}")).unwrap_or_default();
+    let path = day_dir.join(format!("{}{tag}-p{page}.html", now.format("%H%M%S")));
     tokio::fs::write(&path, html).await?;
     debug!(path = %path.display(), "saved HTML dump");
     Ok(())
@@ -963,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn save_html_dump_writes_a_file_at_the_expected_layout() {
         let dir = tempfile::tempdir().unwrap();
-        save_html_dump(dir.path(), "<html>hi</html>", 2)
+        save_html_dump(dir.path(), "<html>hi</html>", 2, None)
             .await
             .unwrap();
 
@@ -982,11 +1129,39 @@ mod tests {
         assert_eq!(html_files.len(), 1, "exactly one .html file");
 
         // The page suffix must be part of the name so pages within the same
-        // second don't clobber each other.
+        // second don't clobber each other; the legacy target adds no -f tag.
         let name = html_files[0].file_name().to_string_lossy().into_owned();
         assert!(name.ends_with("-p2.html"), "{name}");
+        assert!(
+            !name.contains("-f"),
+            "legacy dump must have no filter tag: {name}"
+        );
 
         let body = std::fs::read_to_string(html_files[0].path()).unwrap();
         assert_eq!(body, "<html>hi</html>");
+    }
+
+    #[tokio::test]
+    async fn save_html_dump_tags_saved_filter_dumps_with_the_filter_id() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two filters dumping the same page within the same second must land
+        // in two files (#10, stage 2) — the -fID segment disambiguates.
+        save_html_dump(dir.path(), "a", 1, Some(7)).await.unwrap();
+        save_html_dump(dir.path(), "b", 1, Some(8)).await.unwrap();
+
+        let day_dir = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .next()
+            .unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(day_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "one dump per filter: {names:?}");
+        assert!(names[0].ends_with("-f7-p1.html"), "{names:?}");
+        assert!(names[1].ends_with("-f8-p1.html"), "{names:?}");
     }
 }

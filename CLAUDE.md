@@ -56,7 +56,7 @@ These were agreed at project start — don't quietly drop them in a refactor:
 
 1. The poll loop never panics out. All errors in one iteration are logged and the loop continues.
 2. If the scraper returns zero listings `ZERO_RESULTS_ALERT_THRESHOLD` times in a row, send an alert to Telegram (the site likely changed).
-3. While `SAVE_RAW_HTML=true`, every fetched search page is saved under `./dumps/YYYY-MM-DD/<timestamp>-p<page>.html` (the `-p<page>` suffix keeps multi-page cycles from overwriting themselves).
+3. While `SAVE_RAW_HTML=true`, every fetched search page is saved under `./dumps/YYYY-MM-DD/<timestamp>[-f<filter-id>]-p<page>.html` (the `-p<page>` suffix keeps multi-page cycles from overwriting themselves; the `-f<id>` segment does the same for saved filters fetching within the same second, #10).
 4. Network/parse retries use exponential backoff with a cap. No tight retry loops.
 
 ## Project layout
