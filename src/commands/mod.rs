@@ -48,10 +48,11 @@ use crate::dyncatalog;
 
 use catalog::{PRICE_RANGES, YEAR_RANGES};
 use handlers::{
-    apply_brand, apply_chassis, apply_gearbox, apply_interval, apply_language, apply_models,
-    apply_price_range, apply_reset_all, apply_year_range, format_status, handle_clear,
-    handle_clear_confirm, handle_diag, handle_dump, handle_filter_start, handle_interval,
-    handle_language, handle_pause, handle_resume, handle_set_brand, help_text, models_picker_title,
+    apply_brand, apply_chassis, apply_draft_from, apply_gearbox, apply_interval, apply_language,
+    apply_models, apply_price_range, apply_reset_all, apply_year_range, format_status,
+    handle_clear, handle_clear_confirm, handle_diag, handle_dump, handle_filter_start,
+    handle_interval, handle_language, handle_pause, handle_rename_filter, handle_resume,
+    handle_save_filter, handle_set_brand, help_text, models_picker_title,
 };
 use keyboards::{
     CB_FILTER_BRAND_CLEAR, CB_FILTER_BRAND_CUSTOM_HINT, CB_FILTER_BRAND_PAGE_PREFIX,
@@ -61,10 +62,15 @@ use keyboards::{
     CB_FILTER_INTERVAL_PICKER, CB_FILTER_INTERVAL_SET_PREFIX, CB_FILTER_MENU,
     CB_FILTER_MODELS_PAGE_PREFIX, CB_FILTER_MODELS_PICKER, CB_FILTER_MODELS_SAVE,
     CB_FILTER_MODELS_TOGGLE_PREFIX, CB_FILTER_NOOP, CB_FILTER_PRICE_PICKER,
-    CB_FILTER_RANGE_SET_PREFIX, CB_FILTER_RESET_APPLY, CB_FILTER_RESET_CONFIRM, CB_FILTER_TODO,
-    CB_FILTER_YEAR_PICKER, CB_LANG_SET_PREFIX, brand_picker_keyboard, chassis_picker_keyboard,
-    filter_menu_keyboard, gearbox_picker_keyboard, interval_picker_keyboard,
-    language_picker_keyboard, model_picker_keyboard, range_picker_keyboard, reset_confirm_keyboard,
+    CB_FILTER_RANGE_SET_PREFIX, CB_FILTER_RESET_APPLY, CB_FILTER_RESET_CONFIRM,
+    CB_FILTER_SEL_DELETE_APPLY_PREFIX, CB_FILTER_SEL_DELETE_CONFIRM_PREFIX, CB_FILTER_SEL_NEW_HINT,
+    CB_FILTER_SEL_OPEN_PREFIX, CB_FILTER_SEL_PULL_PREFIX, CB_FILTER_SEL_PUSH_PREFIX,
+    CB_FILTER_SEL_RENAME_HINT_PREFIX, CB_FILTER_SEL_TOGGLE_PREFIX, CB_FILTER_SELECTOR,
+    CB_FILTER_TODO, CB_FILTER_YEAR_PICKER, CB_LANG_SET_PREFIX, back_to_card_keyboard,
+    brand_picker_keyboard, chassis_picker_keyboard, filter_menu_keyboard, filter_selector_keyboard,
+    gearbox_picker_keyboard, interval_picker_keyboard, language_picker_keyboard,
+    model_picker_keyboard, range_picker_keyboard, reset_confirm_keyboard,
+    saved_filter_card_keyboard, saved_filter_delete_confirm_keyboard, selector_back_keyboard,
 };
 
 /// Commands the bot understands.
@@ -107,6 +113,14 @@ pub enum Command {
     ClearConfirm,
     #[command(description = "Настроить фильтры поиска через диалог.")]
     Filter,
+    #[command(
+        description = "Сохранить черновик фильтров как именованный набор (#10). \
+                       Пример: /save_filter bmw"
+    )]
+    SaveFilter(String),
+    #[command(description = "Переименовать набор, открытый в /filter → 💾 Наборы. \
+                       Пример: /rename_filter кабрио")]
+    RenameFilter(String),
     #[command(
         description = "Запасной ручной ввод марки (slug) — на случай, если каталог с сайта \
                        не подтянулся. Обычно проще выбрать в ✏️ Марка. Пример: /setbrand smart"
@@ -190,6 +204,12 @@ pub struct CommandContext {
     /// Plain `std::sync::Mutex` (not `tokio::sync::Mutex`) — we never hold
     /// it across `.await`, and ops are nanoseconds.
     pub pending_clear: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Which saved set's card each user last opened (#10, stage 3), keyed by
+    /// sender id like the draft maps. `/rename_filter` reads it — a command
+    /// argument can't carry "which set" without making the user type ids.
+    /// Stale ids are harmless: every consumer re-reads the row and treats
+    /// "gone" as "show the selector again".
+    pub filter_selection: Arc<Mutex<HashMap<i64, i64>>>,
 }
 
 /// Run the command listener until shutdown signal.
@@ -325,6 +345,8 @@ async fn handle_command(
             return handle_language(bot, &msg, &ctx, arg).await;
         }
         Command::SetBrand(slug) => handle_set_brand(lang, &ctx, slug).await,
+        Command::SaveFilter(name) => handle_save_filter(lang, &ctx, name).await,
+        Command::RenameFilter(name) => handle_rename_filter(lang, &ctx, sender_id, name).await,
         Command::Dump(n) => handle_dump(lang, &ctx, n).await,
         Command::Cancel => lang.cancel().to_string(),
         Command::Diag => handle_diag(lang, &ctx).await,
@@ -378,6 +400,32 @@ async fn handle_unparsed_command(
 #[allow(clippy::expect_used)]
 fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().expect("mutex poisoned")
+}
+
+/// Parses the `<i64>` tail of an id-carrying callback (`f:sel_…:<id>`).
+/// `None` covers both a foreign prefix and a mangled id — the caller skips
+/// the tap, same stance as other malformed-callback branches.
+fn parse_cb_id(data: &str, prefix: &str) -> Option<i64> {
+    data.strip_prefix(prefix)?.parse::<i64>().ok()
+}
+
+/// Renders the saved-sets selector (#10, stage 3). Storage errors degrade to
+/// the draft menu with the generic storage-error text — the wizard must
+/// always answer a tap with *some* screen.
+fn render_selector(lang: Lang, ctx: &CommandContext) -> (String, InlineKeyboardMarkup) {
+    match ctx.storage.list_filters() {
+        Ok(sets) => (
+            lang.selector_body(sets.len()),
+            filter_selector_keyboard(lang, &sets),
+        ),
+        Err(e) => {
+            warn!(error = %e, "couldn't list saved filters");
+            (
+                lang.wizard_storage_error().to_string(),
+                filter_menu_keyboard(lang),
+            )
+        }
+    }
 }
 
 /// Discards `user_id`'s in-flight picker drafts. "Leaving a picker without
@@ -503,6 +551,280 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, ctx: CommandContext) -> Res
                 lang.filter_menu_body(&search, interval_secs),
                 Some(filter_menu_keyboard(lang)),
             )
+        }
+        // --- Saved filter sets (#10, stage 3) ---------------------------
+        CB_FILTER_SELECTOR => {
+            // Entering the selector is a navigation away from any picker —
+            // same discard-on-leave rule as the menu.
+            discard_drafts(&ctx, user_id);
+            let (text, kb) = render_selector(lang, &ctx);
+            (text, Some(kb))
+        }
+        CB_FILTER_SEL_NEW_HINT => (
+            lang.save_filter_hint().to_string(),
+            Some(selector_back_keyboard(lang)),
+        ),
+        s if s.starts_with(CB_FILTER_SEL_OPEN_PREFIX) => {
+            let Some(id) = parse_cb_id(s, CB_FILTER_SEL_OPEN_PREFIX) else {
+                return Ok(());
+            };
+            match ctx.storage.get_filter(id) {
+                Ok(Some(set)) => {
+                    // Remember which card is open — /rename_filter acts on it.
+                    lock_unpoisoned(&ctx.filter_selection).insert(user_id, id);
+                    (
+                        lang.saved_filter_card_body(
+                            &crate::telegram::escape_html(&set.name),
+                            set.enabled,
+                            &set.filter,
+                        ),
+                        Some(saved_filter_card_keyboard(lang, id, set.enabled)),
+                    )
+                }
+                // Stale id (deleted elsewhere) — fall back to the live list.
+                Ok(None) => {
+                    let (text, kb) = render_selector(lang, &ctx);
+                    (text, Some(kb))
+                }
+                Err(e) => {
+                    warn!(error = %e, id, "couldn't load saved filter");
+                    (
+                        lang.wizard_storage_error().to_string(),
+                        Some(selector_back_keyboard(lang)),
+                    )
+                }
+            }
+        }
+        s if s.starts_with(CB_FILTER_SEL_TOGGLE_PREFIX) => {
+            let Some(id) = parse_cb_id(s, CB_FILTER_SEL_TOGGLE_PREFIX) else {
+                return Ok(());
+            };
+            match ctx.storage.get_filter(id) {
+                Ok(Some(set)) => {
+                    let enable = !set.enabled;
+                    match ctx.storage.set_filter_enabled(id, enable) {
+                        Ok(true) => {
+                            // Poll composition changed; nudge the loop.
+                            ctx.runtime_changed.notify_one();
+                            (
+                                lang.saved_filter_card_body(
+                                    &crate::telegram::escape_html(&set.name),
+                                    enable,
+                                    &set.filter,
+                                ),
+                                Some(saved_filter_card_keyboard(lang, id, enable)),
+                            )
+                        }
+                        Ok(false) => {
+                            let (text, kb) = render_selector(lang, &ctx);
+                            (text, Some(kb))
+                        }
+                        Err(e) => {
+                            warn!(error = %e, id, "couldn't toggle saved filter");
+                            (
+                                lang.wizard_storage_error().to_string(),
+                                Some(back_to_card_keyboard(lang, id)),
+                            )
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let (text, kb) = render_selector(lang, &ctx);
+                    (text, Some(kb))
+                }
+                Err(e) => {
+                    warn!(error = %e, id, "couldn't load saved filter for toggle");
+                    (
+                        lang.wizard_storage_error().to_string(),
+                        Some(selector_back_keyboard(lang)),
+                    )
+                }
+            }
+        }
+        s if s.starts_with(CB_FILTER_SEL_PULL_PREFIX) => {
+            let Some(id) = parse_cb_id(s, CB_FILTER_SEL_PULL_PREFIX) else {
+                return Ok(());
+            };
+            match ctx.storage.get_filter(id) {
+                Ok(Some(set)) => {
+                    if apply_draft_from(&ctx, &set.filter).await {
+                        // Land straight in the section menu: pull exists to
+                        // edit these fields, so save the extra tap.
+                        let (search, interval_secs) = {
+                            let r = ctx.runtime.read().await;
+                            (r.search.clone(), r.poll_interval.as_secs())
+                        };
+                        (
+                            format!(
+                                "{}\n\n{}",
+                                lang.filter_pull_done(&crate::telegram::escape_html(&set.name)),
+                                lang.filter_menu_body(&search, interval_secs)
+                            ),
+                            Some(filter_menu_keyboard(lang)),
+                        )
+                    } else {
+                        (
+                            lang.wizard_storage_error().to_string(),
+                            Some(back_to_card_keyboard(lang, id)),
+                        )
+                    }
+                }
+                Ok(None) => {
+                    let (text, kb) = render_selector(lang, &ctx);
+                    (text, Some(kb))
+                }
+                Err(e) => {
+                    warn!(error = %e, id, "couldn't load saved filter for pull");
+                    (
+                        lang.wizard_storage_error().to_string(),
+                        Some(selector_back_keyboard(lang)),
+                    )
+                }
+            }
+        }
+        s if s.starts_with(CB_FILTER_SEL_PUSH_PREFIX) => {
+            let Some(id) = parse_cb_id(s, CB_FILTER_SEL_PUSH_PREFIX) else {
+                return Ok(());
+            };
+            match ctx.storage.get_filter(id) {
+                Ok(Some(set)) => {
+                    let draft = ctx.runtime.read().await.search.clone();
+                    match ctx.storage.update_filter(id, &draft) {
+                        Ok(true) => {
+                            ctx.runtime_changed.notify_one();
+                            (
+                                format!(
+                                    "{}\n\n{}",
+                                    lang.filter_push_done(&crate::telegram::escape_html(&set.name)),
+                                    lang.saved_filter_card_body(
+                                        &crate::telegram::escape_html(&set.name),
+                                        set.enabled,
+                                        &draft,
+                                    )
+                                ),
+                                Some(saved_filter_card_keyboard(lang, id, set.enabled)),
+                            )
+                        }
+                        Ok(false) => {
+                            let (text, kb) = render_selector(lang, &ctx);
+                            (text, Some(kb))
+                        }
+                        Err(e) => {
+                            warn!(error = %e, id, "couldn't push draft into saved filter");
+                            (
+                                lang.wizard_storage_error().to_string(),
+                                Some(back_to_card_keyboard(lang, id)),
+                            )
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let (text, kb) = render_selector(lang, &ctx);
+                    (text, Some(kb))
+                }
+                Err(e) => {
+                    warn!(error = %e, id, "couldn't load saved filter for push");
+                    (
+                        lang.wizard_storage_error().to_string(),
+                        Some(selector_back_keyboard(lang)),
+                    )
+                }
+            }
+        }
+        s if s.starts_with(CB_FILTER_SEL_RENAME_HINT_PREFIX) => {
+            let Some(id) = parse_cb_id(s, CB_FILTER_SEL_RENAME_HINT_PREFIX) else {
+                return Ok(());
+            };
+            match ctx.storage.get_filter(id) {
+                Ok(Some(set)) => {
+                    // The card already recorded the selection on open; re-insert
+                    // anyway so the hint is self-sufficient.
+                    lock_unpoisoned(&ctx.filter_selection).insert(user_id, id);
+                    (
+                        lang.rename_filter_hint(&crate::telegram::escape_html(&set.name)),
+                        Some(back_to_card_keyboard(lang, id)),
+                    )
+                }
+                Ok(None) => {
+                    let (text, kb) = render_selector(lang, &ctx);
+                    (text, Some(kb))
+                }
+                Err(e) => {
+                    warn!(error = %e, id, "couldn't load saved filter for rename hint");
+                    (
+                        lang.wizard_storage_error().to_string(),
+                        Some(selector_back_keyboard(lang)),
+                    )
+                }
+            }
+        }
+        s if s.starts_with(CB_FILTER_SEL_DELETE_CONFIRM_PREFIX) => {
+            let Some(id) = parse_cb_id(s, CB_FILTER_SEL_DELETE_CONFIRM_PREFIX) else {
+                return Ok(());
+            };
+            match ctx.storage.get_filter(id) {
+                Ok(Some(set)) => (
+                    lang.filter_delete_confirm_body(&crate::telegram::escape_html(&set.name)),
+                    Some(saved_filter_delete_confirm_keyboard(lang, id)),
+                ),
+                Ok(None) => {
+                    let (text, kb) = render_selector(lang, &ctx);
+                    (text, Some(kb))
+                }
+                Err(e) => {
+                    warn!(error = %e, id, "couldn't load saved filter for delete confirm");
+                    (
+                        lang.wizard_storage_error().to_string(),
+                        Some(selector_back_keyboard(lang)),
+                    )
+                }
+            }
+        }
+        s if s.starts_with(CB_FILTER_SEL_DELETE_APPLY_PREFIX) => {
+            let Some(id) = parse_cb_id(s, CB_FILTER_SEL_DELETE_APPLY_PREFIX) else {
+                return Ok(());
+            };
+            // Name first (for the goodbye text), then delete. A row that
+            // vanished between the confirm screen and this tap falls through
+            // to the selector — the outcome the delete wanted anyway.
+            match ctx.storage.get_filter(id) {
+                Ok(Some(set)) => match ctx.storage.delete_filter(id) {
+                    Ok(_) => {
+                        // Dedup history went with the row (FK cascade); a
+                        // selection pointing here would now just say "gone".
+                        lock_unpoisoned(&ctx.filter_selection).retain(|_, v| *v != id);
+                        ctx.runtime_changed.notify_one();
+                        info!(id, name = %set.name, "saved filter deleted");
+                        let (list_text, kb) = render_selector(lang, &ctx);
+                        (
+                            format!(
+                                "{}\n\n{}",
+                                lang.filter_deleted(&crate::telegram::escape_html(&set.name)),
+                                list_text
+                            ),
+                            Some(kb),
+                        )
+                    }
+                    Err(e) => {
+                        warn!(error = %e, id, "couldn't delete saved filter");
+                        (
+                            lang.wizard_storage_error().to_string(),
+                            Some(back_to_card_keyboard(lang, id)),
+                        )
+                    }
+                },
+                Ok(None) => {
+                    let (text, kb) = render_selector(lang, &ctx);
+                    (text, Some(kb))
+                }
+                Err(e) => {
+                    warn!(error = %e, id, "couldn't load saved filter for delete");
+                    (
+                        lang.wizard_storage_error().to_string(),
+                        Some(selector_back_keyboard(lang)),
+                    )
+                }
+            }
         }
         CB_FILTER_BRAND_PICKER => {
             // Reachable both from the menu and via "back" from the models

@@ -564,6 +564,34 @@ impl Storage {
             .collect()
     }
 
+    /// One saved filter by id; `None` when the row doesn't exist (deleted
+    /// elsewhere, stale callback id — the wizard treats both as "re-render
+    /// the selector", not as errors).
+    pub fn get_filter(&self, id: i64) -> Result<Option<SavedFilter>> {
+        let conn = self.conn();
+        let row: Option<(i64, String, String, bool)> = conn
+            .query_row(
+                "SELECT id, name, filter_json, enabled FROM filters WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .with_context(|| format!("fetching filter {id}"))?;
+        // `transpose`: Option<Result<..>> -> Result<Option<..>> — lets the
+        // JSON-parse error ride the `?` while "no row" stays a plain None.
+        row.map(|(id, name, json, enabled)| {
+            let filter = serde_json::from_str(&json)
+                .with_context(|| format!("parsing filter {id} ({name:?})"))?;
+            Ok(SavedFilter {
+                id,
+                name,
+                filter,
+                enabled,
+            })
+        })
+        .transpose()
+    }
+
     /// Replaces the filter payload of an existing row. Returns `false` when
     /// the id doesn't exist (caller decides whether that's an error).
     pub fn update_filter(&self, id: i64, filter: &SearchFilter) -> Result<bool> {
@@ -992,6 +1020,13 @@ mod tests {
         assert_eq!(row.name, "bmw-cheap");
         assert_eq!(row.filter.price_to, Some(5000));
         assert!(!row.enabled);
+
+        // Single-row fetch sees the same state as list; a ghost id is None.
+        let one = s.get_filter(id).unwrap().unwrap();
+        assert_eq!(one.name, "bmw-cheap");
+        assert_eq!(one.filter.price_to, Some(5000));
+        assert!(!one.enabled);
+        assert!(s.get_filter(999).unwrap().is_none());
 
         // Operations on a ghost id report "nothing changed", not an error.
         assert!(!s.rename_filter(999, "x").unwrap());

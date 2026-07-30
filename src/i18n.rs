@@ -597,6 +597,275 @@ impl Lang {
         }
     }
 
+    // -- saved filter sets (#10, stage 3) ------------------------------------
+
+    pub fn btn_saved_sets(self) -> &'static str {
+        match self {
+            Lang::Ru => "💾 Наборы фильтров",
+            Lang::Sr => "💾 Sačuvani setovi",
+        }
+    }
+
+    pub fn btn_new_filter(self) -> &'static str {
+        match self {
+            Lang::Ru => "➕ Новый набор",
+            Lang::Sr => "➕ Novi set",
+        }
+    }
+
+    pub fn btn_draft_menu(self) -> &'static str {
+        match self {
+            Lang::Ru => "⚙️ Черновик (секции)",
+            Lang::Sr => "⚙️ Radna verzija (sekcije)",
+        }
+    }
+
+    pub fn btn_filter_enable(self) -> &'static str {
+        match self {
+            Lang::Ru => "▶️ Включить",
+            Lang::Sr => "▶️ Uključi",
+        }
+    }
+
+    pub fn btn_filter_disable(self) -> &'static str {
+        match self {
+            Lang::Ru => "⏸ Выключить",
+            Lang::Sr => "⏸ Isključi",
+        }
+    }
+
+    pub fn btn_filter_pull(self) -> &'static str {
+        match self {
+            Lang::Ru => "📤 В черновик",
+            Lang::Sr => "📤 U radnu verziju",
+        }
+    }
+
+    pub fn btn_filter_push(self) -> &'static str {
+        match self {
+            Lang::Ru => "📥 Из черновика",
+            Lang::Sr => "📥 Iz radne verzije",
+        }
+    }
+
+    pub fn btn_filter_rename(self) -> &'static str {
+        match self {
+            Lang::Ru => "✏️ Переименовать",
+            Lang::Sr => "✏️ Preimenuj",
+        }
+    }
+
+    pub fn btn_filter_delete(self) -> &'static str {
+        match self {
+            Lang::Ru => "🗑 Удалить",
+            Lang::Sr => "🗑 Obriši",
+        }
+    }
+
+    pub fn btn_delete_yes(self) -> &'static str {
+        match self {
+            Lang::Ru => "✅ Да, удалить",
+            Lang::Sr => "✅ Da, obriši",
+        }
+    }
+
+    /// Selector screen. `count == 0` renders the on-ramp explanation: with an
+    /// empty table the poll loop still runs the draft filter (stage 2), so
+    /// the copy has to say what "saving a set" changes.
+    pub fn selector_body(self, count: usize) -> String {
+        match (self, count) {
+            (Lang::Ru, 0) => "💾 <b>Наборы фильтров</b>\n\n\
+                 Сохранённых наборов пока нет — бот опрашивает черновик \
+                 (секции из /filter). Настрой черновик и сохрани его: \
+                 <code>/save_filter имя</code>. Как только появится первый \
+                 набор, опрашиваются только включённые наборы."
+                .to_string(),
+            (Lang::Sr, 0) => "💾 <b>Sačuvani setovi</b>\n\n\
+                 Još nema sačuvanih setova — bot proverava radnu verziju \
+                 (sekcije iz /filter). Podesi radnu verziju i sačuvaj je: \
+                 <code>/save_filter ime</code>. Čim se pojavi prvi set, \
+                 proveravaju se samo uključeni setovi."
+                .to_string(),
+            (Lang::Ru, n) => format!(
+                "💾 <b>Наборы фильтров</b> ({n})\n\n\
+                 Опрашиваются только включённые (✅). Жми на набор — карточка \
+                 с действиями; поля редактируются через черновик \
+                 (📤 в черновик → секции → 📥 из черновика)."
+            ),
+            (Lang::Sr, n) => format!(
+                "💾 <b>Sačuvani setovi</b> ({n})\n\n\
+                 Proveravaju se samo uključeni (✅). Pritisni set za karticu \
+                 sa akcijama; polja se menjaju kroz radnu verziju \
+                 (📤 u radnu verziju → sekcije → 📥 iz radne verzije)."
+            ),
+        }
+    }
+
+    /// Card of one saved set (name already HTML-escaped by the caller).
+    pub fn saved_filter_card_body(
+        self,
+        name_escaped: &str,
+        enabled: bool,
+        f: &SearchFilter,
+    ) -> String {
+        let summary = self.filter_summary(f);
+        let status = match (self, enabled) {
+            (Lang::Ru, true) => "✅ включён — участвует в опросе",
+            (Lang::Ru, false) => "⏸ выключен — пропускается",
+            (Lang::Sr, true) => "✅ uključen — učestvuje u proveri",
+            (Lang::Sr, false) => "⏸ isključen — preskače se",
+        };
+        match self {
+            Lang::Ru => {
+                format!("💾 Набор <b>{name_escaped}</b>\n{status}\n\n<b>Поля</b>\n{summary}")
+            }
+            Lang::Sr => {
+                format!("💾 Set <b>{name_escaped}</b>\n{status}\n\n<b>Polja</b>\n{summary}")
+            }
+        }
+    }
+
+    pub fn save_filter_hint(self) -> &'static str {
+        match self {
+            Lang::Ru => {
+                "Создание набора: настрой черновик в /filter и отправь \
+                 <code>/save_filter имя</code> — текущие поля черновика сохранятся \
+                 под этим именем."
+            }
+            Lang::Sr => {
+                "Novi set: podesi radnu verziju u /filter i pošalji \
+                 <code>/save_filter ime</code> — trenutna polja radne verzije \
+                 biće sačuvana pod tim imenom."
+            }
+        }
+    }
+
+    pub fn rename_filter_hint(self, name_escaped: &str) -> String {
+        match self {
+            Lang::Ru => format!(
+                "Переименование <b>{name_escaped}</b>: отправь \
+                 <code>/rename_filter новое-имя</code>."
+            ),
+            Lang::Sr => format!(
+                "Preimenovanje <b>{name_escaped}</b>: pošalji \
+                 <code>/rename_filter novo-ime</code>."
+            ),
+        }
+    }
+
+    pub fn save_filter_saved(self, name_escaped: &str) -> String {
+        match self {
+            Lang::Ru => format!(
+                "✅ Набор <b>{name_escaped}</b> сохранён из черновика. \
+                 Опрашиваются только включённые наборы — смотри /filter."
+            ),
+            Lang::Sr => format!(
+                "✅ Set <b>{name_escaped}</b> je sačuvan iz radne verzije. \
+                 Proveravaju se samo uključeni setovi — vidi /filter."
+            ),
+        }
+    }
+
+    pub fn save_filter_bad_name(self) -> &'static str {
+        match self {
+            Lang::Ru => {
+                "❌ Имя набора — от 1 до 40 символов: <code>/save_filter имя</code> \
+                 (например, /save_filter bmw)."
+            }
+            Lang::Sr => {
+                "❌ Ime seta — od 1 do 40 znakova: <code>/save_filter ime</code> \
+                 (na primer, /save_filter bmw)."
+            }
+        }
+    }
+
+    pub fn wizard_storage_error(self) -> &'static str {
+        match self {
+            Lang::Ru => "❌ Не получилось записать в базу — глянь логи бота.",
+            Lang::Sr => "❌ Upis u bazu nije uspeo — pogledaj logove bota.",
+        }
+    }
+
+    pub fn save_filter_name_taken(self, name_escaped: &str) -> String {
+        match self {
+            Lang::Ru => format!(
+                "❌ Имя <b>{name_escaped}</b> уже занято — выбери другое или \
+                 переименуй старый набор."
+            ),
+            Lang::Sr => format!(
+                "❌ Ime <b>{name_escaped}</b> je već zauzeto — izaberi drugo ili \
+                 preimenuj stari set."
+            ),
+        }
+    }
+
+    pub fn rename_filter_done(self, name_escaped: &str) -> String {
+        match self {
+            Lang::Ru => format!("✅ Набор переименован в <b>{name_escaped}</b>."),
+            Lang::Sr => format!("✅ Set je preimenovan u <b>{name_escaped}</b>."),
+        }
+    }
+
+    pub fn rename_filter_no_selection(self) -> &'static str {
+        match self {
+            Lang::Ru => {
+                "❌ Сначала открой набор в /filter (💾 Наборы фильтров) — \
+                 переименование применяется к открытому набору."
+            }
+            Lang::Sr => {
+                "❌ Prvo otvori set u /filter (💾 Sačuvani setovi) — \
+                 preimenovanje se odnosi na otvoreni set."
+            }
+        }
+    }
+
+    pub fn filter_delete_confirm_body(self, name_escaped: &str) -> String {
+        match self {
+            Lang::Ru => format!(
+                "🗑 Удалить набор <b>{name_escaped}</b>? Его история дедупа \
+                 уйдёт вместе с ним."
+            ),
+            Lang::Sr => format!(
+                "🗑 Obrisati set <b>{name_escaped}</b>? Njegova istorija \
+                 dedupa ide zajedno sa njim."
+            ),
+        }
+    }
+
+    pub fn filter_deleted(self, name_escaped: &str) -> String {
+        match self {
+            Lang::Ru => format!("✅ Набор <b>{name_escaped}</b> удалён."),
+            Lang::Sr => format!("✅ Set <b>{name_escaped}</b> je obrisan."),
+        }
+    }
+
+    pub fn filter_pull_done(self, name_escaped: &str) -> String {
+        match self {
+            Lang::Ru => format!(
+                "📤 Поля набора <b>{name_escaped}</b> скопированы в черновик — \
+                 редактируй секции и верни их 📥 Из черновика."
+            ),
+            Lang::Sr => format!(
+                "📤 Polja seta <b>{name_escaped}</b> su kopirana u radnu verziju — \
+                 izmeni sekcije i vrati ih 📥 Iz radne verzije."
+            ),
+        }
+    }
+
+    pub fn filter_push_done(self, name_escaped: &str) -> String {
+        match self {
+            Lang::Ru => format!("📥 Черновик записан в набор <b>{name_escaped}</b>."),
+            Lang::Sr => format!("📥 Radna verzija je upisana u set <b>{name_escaped}</b>."),
+        }
+    }
+
+    pub fn filter_gone(self) -> &'static str {
+        match self {
+            Lang::Ru => "Этого набора уже нет — список обновлён.",
+            Lang::Sr => "Tog seta više nema — spisak je osvežen.",
+        }
+    }
+
     /// Model-picker title (brand already HTML-escaped by the caller).
     pub fn models_picker_title(self, brand_escaped: &str) -> String {
         match self {
@@ -1009,6 +1278,8 @@ pub fn help_sr() -> &'static str {
      /clear — Pripremi brisanje istorije.\n\
      /clear_confirm — Potvrdi brisanje (30 sek nakon /clear).\n\
      /filter — Podesi filtere pretrage kroz dijalog.\n\
+     /save_filter — Sačuvaj radnu verziju filtera kao imenovani set. Primer: /save_filter bmw\n\
+     /rename_filter — Preimenuj otvoreni set (otvori ga kroz /filter). Primer: /rename_filter kabrio\n\
      /setbrand — Rezervni ručni unos marke (slug) — ako se katalog sa sajta ne \
      povuče. Obično je lakše izabrati u ✏️ Marka. Primer: /setbrand smart\n\
      /dump — Prikaži poslednjih N sačuvanih oglasa (1-25). Primer: /dump 10\n\
