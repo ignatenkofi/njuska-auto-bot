@@ -85,6 +85,20 @@ pub(super) const CB_FILTER_MODELS_SAVE: &str = "f:models_save";
 /// Jump the model picker to a page: `f:models_page:<page>`.
 pub(super) const CB_FILTER_MODELS_PAGE_PREFIX: &str = "f:models_page:";
 
+// Saved filter sets (#10, stage 3): selector → per-set card → actions.
+// Field edits stay in the draft (the legacy section menu): the card's
+// pull/push buttons copy fields draft↔set, so none of the section pickers
+// had to learn about set ids. Data with an id is `f:sel_…:<i64>`.
+pub(super) const CB_FILTER_SELECTOR: &str = "f:sel";
+pub(super) const CB_FILTER_SEL_OPEN_PREFIX: &str = "f:sel_open:";
+pub(super) const CB_FILTER_SEL_TOGGLE_PREFIX: &str = "f:sel_tgl:";
+pub(super) const CB_FILTER_SEL_PULL_PREFIX: &str = "f:sel_pull:";
+pub(super) const CB_FILTER_SEL_PUSH_PREFIX: &str = "f:sel_push:";
+pub(super) const CB_FILTER_SEL_RENAME_HINT_PREFIX: &str = "f:sel_ren:";
+pub(super) const CB_FILTER_SEL_DELETE_CONFIRM_PREFIX: &str = "f:sel_del:";
+pub(super) const CB_FILTER_SEL_DELETE_APPLY_PREFIX: &str = "f:sel_delgo:";
+pub(super) const CB_FILTER_SEL_NEW_HINT: &str = "f:sel_new";
+
 // Language picker (issue #33). Not under the `f:` (filter) namespace — it's a
 // standalone `/language` screen, so it gets its own `lang:` prefix. Data is
 // `lang:set:<code>` where `<code>` is a `Lang::as_code()` value (ru/sr).
@@ -179,11 +193,122 @@ pub(super) fn filter_menu_keyboard(lang: Lang) -> InlineKeyboardMarkup {
             lang.btn_interval(),
             CB_FILTER_INTERVAL_PICKER,
         )],
+        // Saved sets live one level up from the sections (#10, stage 3): the
+        // menu edits the draft, the selector manages what actually polls.
+        vec![InlineKeyboardButton::callback(
+            lang.btn_saved_sets(),
+            CB_FILTER_SELECTOR,
+        )],
         vec![
             InlineKeyboardButton::callback(lang.btn_reset(), CB_FILTER_RESET_CONFIRM),
             InlineKeyboardButton::callback(lang.btn_done(), CB_FILTER_DONE),
         ],
     ])
+}
+
+/// Selector of saved filter sets (#10, stage 3): one row per set — the label
+/// carries the enabled marker, the tap opens the set's card. Set names are
+/// button labels (plain text to Telegram), so no HTML escaping here.
+pub(super) fn filter_selector_keyboard(
+    lang: Lang,
+    sets: &[crate::storage::SavedFilter],
+) -> InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = sets
+        .iter()
+        .map(|s| {
+            let marker = if s.enabled { "✅" } else { "⏸" };
+            vec![InlineKeyboardButton::callback(
+                format!("{marker} {}", s.name),
+                format!("{CB_FILTER_SEL_OPEN_PREFIX}{}", s.id),
+            )]
+        })
+        .collect();
+    rows.push(vec![InlineKeyboardButton::callback(
+        lang.btn_new_filter(),
+        CB_FILTER_SEL_NEW_HINT,
+    )]);
+    rows.push(vec![
+        InlineKeyboardButton::callback(lang.btn_draft_menu(), CB_FILTER_MENU),
+        InlineKeyboardButton::callback(lang.btn_done(), CB_FILTER_DONE),
+    ]);
+    InlineKeyboardMarkup::new(rows)
+}
+
+/// Action card of one saved set (#10, stage 3). Every id-carrying action
+/// re-reads the row in the handler — a stale id (set deleted elsewhere)
+/// degrades to "re-render the selector", never to acting on the wrong set.
+pub(super) fn saved_filter_card_keyboard(
+    lang: Lang,
+    id: i64,
+    enabled: bool,
+) -> InlineKeyboardMarkup {
+    let toggle_label = if enabled {
+        lang.btn_filter_disable()
+    } else {
+        lang.btn_filter_enable()
+    };
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            toggle_label,
+            format!("{CB_FILTER_SEL_TOGGLE_PREFIX}{id}"),
+        )],
+        vec![
+            InlineKeyboardButton::callback(
+                lang.btn_filter_pull(),
+                format!("{CB_FILTER_SEL_PULL_PREFIX}{id}"),
+            ),
+            InlineKeyboardButton::callback(
+                lang.btn_filter_push(),
+                format!("{CB_FILTER_SEL_PUSH_PREFIX}{id}"),
+            ),
+        ],
+        vec![
+            InlineKeyboardButton::callback(
+                lang.btn_filter_rename(),
+                format!("{CB_FILTER_SEL_RENAME_HINT_PREFIX}{id}"),
+            ),
+            InlineKeyboardButton::callback(
+                lang.btn_filter_delete(),
+                format!("{CB_FILTER_SEL_DELETE_CONFIRM_PREFIX}{id}"),
+            ),
+        ],
+        vec![InlineKeyboardButton::callback(
+            lang.btn_back(),
+            CB_FILTER_SELECTOR,
+        )],
+    ])
+}
+
+/// Single back-button row into the selector — used by the hint screens
+/// (create/rename guidance), which have text but no state to act on.
+pub(super) fn selector_back_keyboard(lang: Lang) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        lang.btn_back(),
+        CB_FILTER_SELECTOR,
+    )]])
+}
+
+/// Single back-button row into one set's card.
+pub(super) fn back_to_card_keyboard(lang: Lang, id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        lang.btn_back(),
+        format!("{CB_FILTER_SEL_OPEN_PREFIX}{id}"),
+    )]])
+}
+
+/// Delete confirmation for one saved set — same two-button shape as the
+/// "reset all" prompt: only the explicit ✅ actually deletes.
+pub(super) fn saved_filter_delete_confirm_keyboard(lang: Lang, id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(
+            lang.btn_delete_yes(),
+            format!("{CB_FILTER_SEL_DELETE_APPLY_PREFIX}{id}"),
+        ),
+        InlineKeyboardButton::callback(
+            lang.btn_cancel(),
+            format!("{CB_FILTER_SEL_OPEN_PREFIX}{id}"),
+        ),
+    ]])
 }
 
 /// Interval picker keyboard. Same single-tap-commit pattern as price/year

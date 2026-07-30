@@ -20,9 +20,10 @@ use crate::config::{
     SETTING_SEARCH_PRICE_TO, SETTING_SEARCH_YEAR_FROM, SETTING_SEARCH_YEAR_TO,
 };
 use crate::i18n::Lang;
+use crate::models::SearchFilter;
 use crate::telegram::{escape_html, escape_html_attr};
 
-use super::keyboards::{filter_menu_keyboard, language_picker_keyboard};
+use super::keyboards::{filter_menu_keyboard, filter_selector_keyboard, language_picker_keyboard};
 use super::{CLEAR_CONFIRM_WINDOW, CommandContext, lock_unpoisoned};
 
 pub(super) async fn format_status(lang: Lang, ctx: &CommandContext) -> String {
@@ -347,6 +348,24 @@ pub(super) async fn handle_filter_start(
         let r = ctx.runtime.read().await;
         (r.search.clone(), r.poll_interval.as_secs(), r.lang)
     };
+
+    // Saved sets take the front seat once they exist (#10, stage 3): /filter
+    // opens the selector — what actually polls — and the draft menu is one
+    // tap away. An empty table keeps the pre-#10 entry: straight into the
+    // section menu. A storage error falls back to the menu too (degrading to
+    // "the bot still configures" beats a dead /filter).
+    match ctx.storage.list_filters() {
+        Ok(sets) if !sets.is_empty() => {
+            bot.send_message(msg.chat.id, lang.selector_body(sets.len()))
+                .parse_mode(ParseMode::Html)
+                .reply_markup(filter_selector_keyboard(lang, &sets))
+                .await?;
+            return Ok(());
+        }
+        Err(e) => warn!(error = %e, "couldn't list saved filters; opening draft menu"),
+        Ok(_) => {}
+    }
+
     bot.send_message(msg.chat.id, lang.filter_menu_body(&search, interval_secs))
         .parse_mode(ParseMode::Html)
         .reply_markup(filter_menu_keyboard(lang))
@@ -651,6 +670,165 @@ pub(super) async fn apply_brand(ctx: &CommandContext, new_brand: Option<String>)
     );
 }
 
+/// Copies a saved set's fields into the draft (`RuntimeConfig.search`) —
+/// the card's 📤 pull action (#10, stage 3). Same persist-first contract as
+/// the section `apply_*`s, batched over every field key: any failed write
+/// bails with RAM untouched (`false`); partial DB / clean RAM recovers on
+/// restart like everywhere else. `show_old_new` / `without_price` are
+/// env-owned display options, not wizard fields — not copied.
+pub(super) async fn apply_draft_from(ctx: &CommandContext, f: &SearchFilter) -> bool {
+    let pairs: [(&str, String); 8] = [
+        (SETTING_SEARCH_BRAND, f.brand.clone().unwrap_or_default()),
+        (SETTING_SEARCH_MODELS, f.models.join(",")),
+        (
+            SETTING_SEARCH_CHASSIS,
+            f.chassis
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            SETTING_SEARCH_GEARBOX,
+            f.gearbox
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            SETTING_SEARCH_PRICE_FROM,
+            f.price_from.map(|v| v.to_string()).unwrap_or_default(),
+        ),
+        (
+            SETTING_SEARCH_PRICE_TO,
+            f.price_to.map(|v| v.to_string()).unwrap_or_default(),
+        ),
+        (
+            SETTING_SEARCH_YEAR_FROM,
+            f.year_from.map(|v| v.to_string()).unwrap_or_default(),
+        ),
+        (
+            SETTING_SEARCH_YEAR_TO,
+            f.year_to.map(|v| v.to_string()).unwrap_or_default(),
+        ),
+    ];
+    for (key, value) in &pairs {
+        if let Err(e) = ctx.storage.set_setting(key, value) {
+            warn!(error = %e, key, "couldn't persist draft field during pull");
+            return false;
+        }
+    }
+
+    {
+        let mut r = ctx.runtime.write().await;
+        r.search.brand = f.brand.clone();
+        r.search.models = f.models.clone();
+        r.search.chassis = f.chassis.clone();
+        r.search.gearbox = f.gearbox.clone();
+        r.search.price_from = f.price_from;
+        r.search.price_to = f.price_to;
+        r.search.year_from = f.year_from;
+        r.search.year_to = f.year_to;
+    }
+    ctx.runtime_changed.notify_one();
+    info!("draft replaced from saved filter");
+    true
+}
+
+/// Longest saved-set name the wizard accepts (#10, stage 3). Names become
+/// inline-button labels; Telegram truncates long labels with an ellipsis, so
+/// past ~40 chars the selector stops being readable.
+pub(super) const MAX_FILTER_NAME_CHARS: usize = 40;
+
+/// `/save_filter <name>`: snapshot the draft (`RuntimeConfig.search`) into a
+/// new saved set. The first saved set flips the poll loop from draft-polling
+/// to sets-polling (stage 2) — the reply copy says so.
+///
+/// The UNIQUE(name) check is a `list_filters` pre-check rather than decoding
+/// the SQLite constraint error out of `anyhow`: single-operator bot, the
+/// create-create race is theoretical, and the pre-check keeps the storage
+/// error type opaque here.
+pub(super) async fn handle_save_filter(
+    lang: Lang,
+    ctx: &CommandContext,
+    raw_name: String,
+) -> String {
+    let name = raw_name.trim();
+    if name.is_empty() || name.chars().count() > MAX_FILTER_NAME_CHARS {
+        return lang.save_filter_bad_name().to_string();
+    }
+    match ctx.storage.list_filters() {
+        Ok(sets) if sets.iter().any(|s| s.name == name) => {
+            return lang.save_filter_name_taken(&escape_html(name));
+        }
+        Err(e) => {
+            warn!(error = %e, "couldn't list filters before save");
+            return lang.wizard_storage_error().to_string();
+        }
+        Ok(_) => {}
+    }
+
+    let snapshot = ctx.runtime.read().await.search.clone();
+    match ctx.storage.create_filter(name, &snapshot) {
+        Ok(id) => {
+            // The next cycle picks the new set up by itself (the loop re-reads
+            // the table every cycle); the nudge just makes it immediate.
+            ctx.runtime_changed.notify_one();
+            info!(id, name, "saved filter created from draft");
+            lang.save_filter_saved(&escape_html(name))
+        }
+        Err(e) => {
+            warn!(error = %e, name, "couldn't create saved filter");
+            lang.wizard_storage_error().to_string()
+        }
+    }
+}
+
+/// `/rename_filter <name>`: renames the set whose card this user last opened
+/// (the wizard keeps that in `filter_selection`). A command-with-argument
+/// instead of a free-text listener — same idiom as `/setbrand` — so the
+/// dispatcher stays stateless about "what is the user typing right now".
+pub(super) async fn handle_rename_filter(
+    lang: Lang,
+    ctx: &CommandContext,
+    user_id: i64,
+    raw_name: String,
+) -> String {
+    let name = raw_name.trim();
+    if name.is_empty() || name.chars().count() > MAX_FILTER_NAME_CHARS {
+        return lang.save_filter_bad_name().to_string();
+    }
+    let Some(id) = lock_unpoisoned(&ctx.filter_selection)
+        .get(&user_id)
+        .copied()
+    else {
+        return lang.rename_filter_no_selection().to_string();
+    };
+    match ctx.storage.list_filters() {
+        Ok(sets) if sets.iter().any(|s| s.name == name && s.id != id) => {
+            return lang.save_filter_name_taken(&escape_html(name));
+        }
+        Err(e) => {
+            warn!(error = %e, "couldn't list filters before rename");
+            return lang.wizard_storage_error().to_string();
+        }
+        Ok(_) => {}
+    }
+    match ctx.storage.rename_filter(id, name) {
+        Ok(true) => {
+            info!(id, name, "saved filter renamed");
+            lang.rename_filter_done(&escape_html(name))
+        }
+        // The card's id went stale (set deleted from another chat/session).
+        Ok(false) => lang.filter_gone().to_string(),
+        Err(e) => {
+            warn!(error = %e, id, "couldn't rename saved filter");
+            lang.wizard_storage_error().to_string()
+        }
+    }
+}
+
 /// Localized `/help` reply.
 ///
 /// The `setMyCommands` autocomplete menu is bot-global (one payload for every
@@ -946,6 +1124,7 @@ mod tests {
             models_draft: Arc::new(Mutex::new(HashMap::new())),
             gearbox_draft: Arc::new(Mutex::new(HashMap::new())),
             pending_clear: Arc::new(Mutex::new(HashMap::new())),
+            filter_selection: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1106,5 +1285,115 @@ mod tests {
         let r = ctx.runtime.read().await;
         assert_eq!(r.search.brand.as_deref(), Some("mini"));
         assert_eq!(r.search.models, vec!["cooper".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn save_filter_snapshots_the_draft_and_rejects_bad_and_duplicate_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir.path().join("cmd.db"));
+
+        // Tune the draft, then snapshot it under a name.
+        apply_brand(&ctx, Some("bmw".into())).await;
+        let reply = handle_save_filter(Lang::Ru, &ctx, "bmw-cabrio".into()).await;
+        assert!(reply.contains("bmw-cabrio"), "{reply}");
+
+        let sets = ctx.storage.list_filters().unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].name, "bmw-cabrio");
+        assert_eq!(sets[0].filter.brand.as_deref(), Some("bmw"));
+        assert!(sets[0].enabled, "new sets start enabled");
+
+        // Same name again → rejected, still one row.
+        let dup = handle_save_filter(Lang::Ru, &ctx, "  bmw-cabrio ".into()).await;
+        assert!(dup.contains("занято"), "{dup}");
+        assert_eq!(ctx.storage.list_filters().unwrap().len(), 1);
+
+        // Empty and over-long names never reach storage.
+        let empty = handle_save_filter(Lang::Ru, &ctx, "   ".into()).await;
+        assert!(empty.contains("от 1 до 40"), "{empty}");
+        let long = handle_save_filter(Lang::Ru, &ctx, "x".repeat(41)).await;
+        assert!(long.contains("от 1 до 40"), "{long}");
+        assert_eq!(ctx.storage.list_filters().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rename_filter_acts_on_the_open_card_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir.path().join("cmd.db"));
+        let id = ctx
+            .storage
+            .create_filter("old-name", &crate::models::SearchFilter::default())
+            .unwrap();
+        ctx.storage
+            .create_filter("taken", &crate::models::SearchFilter::default())
+            .unwrap();
+
+        // No card open for this user → guidance, nothing renamed.
+        let no_sel = handle_rename_filter(Lang::Ru, &ctx, 111, "fresh".into()).await;
+        assert!(no_sel.contains("открой набор"), "{no_sel}");
+
+        // Open card recorded (as the callback handler does) → rename works.
+        lock_unpoisoned(&ctx.filter_selection).insert(111, id);
+        let ok = handle_rename_filter(Lang::Ru, &ctx, 111, "fresh".into()).await;
+        assert!(ok.contains("fresh"), "{ok}");
+        let names: Vec<String> = ctx
+            .storage
+            .list_filters()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.contains(&"fresh".to_string()), "{names:?}");
+
+        // Renaming onto another set's name → rejected.
+        let clash = handle_rename_filter(Lang::Ru, &ctx, 111, "taken".into()).await;
+        assert!(clash.contains("занято"), "{clash}");
+
+        // Renaming to its own current name is a no-op, not a clash.
+        let same = handle_rename_filter(Lang::Ru, &ctx, 111, "fresh".into()).await;
+        assert!(same.contains("fresh") && !same.contains("занято"), "{same}");
+    }
+
+    #[tokio::test]
+    async fn pull_copies_saved_fields_into_the_draft_persist_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cmd.db");
+        let ctx = test_ctx(&db_path);
+
+        let saved = crate::models::SearchFilter {
+            brand: Some("mini".into()),
+            models: vec!["cooper".into()],
+            price_to: Some(8000),
+            ..Default::default()
+        };
+        assert!(apply_draft_from(&ctx, &saved).await, "pull must succeed");
+
+        let r = ctx.runtime.read().await;
+        assert_eq!(r.search.brand.as_deref(), Some("mini"));
+        assert_eq!(r.search.models, vec!["cooper".to_string()]);
+        assert_eq!(r.search.price_to, Some(8000));
+        drop(r);
+
+        // Persisted too — the draft survives a restart by contract.
+        assert_eq!(
+            ctx.storage.get_setting(SETTING_SEARCH_BRAND).unwrap(),
+            Some("mini".to_string())
+        );
+
+        // A broken DB fails the pull and leaves RAM untouched (#44 rule).
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("DROP TABLE runtime_settings", [])
+            .unwrap();
+        let other = crate::models::SearchFilter {
+            brand: Some("volvo".into()),
+            ..Default::default()
+        };
+        assert!(!apply_draft_from(&ctx, &other).await, "pull must fail");
+        assert_eq!(
+            ctx.runtime.read().await.search.brand.as_deref(),
+            Some("mini"),
+            "failed pull must not touch RAM"
+        );
     }
 }

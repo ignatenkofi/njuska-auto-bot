@@ -123,6 +123,10 @@ async fn main() -> Result<()> {
     // Keyed by user id (#42): each authorized user arms their own `/clear`
     // slot, so one user's `/clear_confirm` can't consume another's.
     let pending_clear = Arc::new(Mutex::new(HashMap::new()));
+    // Which saved set's card each user last opened (#10, stage 3) — the
+    // target of /rename_filter. RAM-only like the drafts: stale ids are
+    // re-checked against storage on every use.
+    let filter_selection = Arc::new(Mutex::new(HashMap::new()));
     // In-flight chassis selections during `/filter → Кузов`, keyed per user
     // id (#9) so concurrent authorized users don't clobber each other's
     // toggles. Absent key = picker not open; entry removed on Save or Back.
@@ -156,6 +160,7 @@ async fn main() -> Result<()> {
             storage: storage.clone(),
             runtime_changed: runtime_changed.clone(),
             pending_clear: pending_clear.clone(),
+            filter_selection: filter_selection.clone(),
             chassis_draft: chassis_draft.clone(),
             models_draft: models_draft.clone(),
             gearbox_draft: gearbox_draft.clone(),
