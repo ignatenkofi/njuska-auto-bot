@@ -135,16 +135,27 @@ sudo useradd --system --create-home --home-dir /opt/njuska-auto-bot --shell /usr
 ## Step 4 — Download the latest binary
 
 ```bash
+cd /opt/njuska-auto-bot
+
 sudo -u njuska curl -L --fail \
     https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot \
-    -o /opt/njuska-auto-bot/njuska_auto_bot
+    -o njuska_auto_bot
 
-sudo -u njuska chmod +x /opt/njuska-auto-bot/njuska_auto_bot
+sudo -u njuska curl -L --fail \
+    https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/SHA256SUMS \
+    -o SHA256SUMS
+
+sha256sum -c SHA256SUMS && sudo -u njuska rm -f SHA256SUMS
+
+sudo -u njuska chmod +x njuska_auto_bot
 
 # Sanity-check
-/opt/njuska-auto-bot/njuska_auto_bot --version 2>/dev/null || \
-    file /opt/njuska-auto-bot/njuska_auto_bot
+./njuska_auto_bot --version 2>/dev/null || file njuska_auto_bot
 ```
+
+Verify first, `chmod +x` second — same order the scripted paths use, and for
+the same reason: an unverified file should not become executable. If
+`sha256sum -c` fails, stop; do not chmod anything.
 
 `releases/latest/download/...` is GitHub's canonical "newest release" URL —
 it redirects to whichever tagged version was most recently published. To
