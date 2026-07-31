@@ -81,8 +81,14 @@ qm create "$VMID" \
     --ostype l26 \
     --agent enabled=1
 
-qm importdisk "$VMID" "$image" "$STORAGE"
-qm set "$VMID" --scsi0 "$STORAGE:vm-$VMID-disk-0"
+# Импорт диска: с PVE 8 канонично `--scsi0 <storage>:0,import-from=<файл>`,
+# старый `qm importdisk` в 9.x может отсутствовать. Пробуем современную форму,
+# при отказе откатываемся на legacy — так скрипт живёт и на старых нодах.
+if ! qm set "$VMID" --scsi0 "$STORAGE:0,import-from=$image" 2>/dev/null; then
+    echo "provision-vm: import-from не принят, пробую legacy importdisk"
+    qm importdisk "$VMID" "$image" "$STORAGE"
+    qm set "$VMID" --scsi0 "$STORAGE:vm-$VMID-disk-0"
+fi
 qm disk resize "$VMID" scsi0 "${DISK_GB}G"
 qm set "$VMID" --boot order=scsi0
 qm set "$VMID" --ide2 "$STORAGE:cloudinit"
