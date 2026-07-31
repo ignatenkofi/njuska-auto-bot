@@ -73,6 +73,13 @@ jobs:
           file target/release/njuska_auto_bot
           ldd target/release/njuska_auto_bot || true
 
+      # Сумма считается здесь, рядом с рождением артефакта, а не в publish:
+      # тогда её проверка в publish подтверждает, что между джобами артефакт
+      # доехал целым. Посчитанная в момент публикации сумма была бы штампом,
+      # который совпадает всегда и не проверяет ничего.
+      - name: Checksum
+        run: sha256sum njuska_auto_bot > SHA256SUMS
+
       - name: Upload binary for downstream jobs
         uses: actions/upload-artifact@v7
         with:
@@ -123,6 +130,10 @@ jobs:
         with:
           name: njuska_auto_bot
 
+      # Артефакт доехал тем же, каким собрался?
+      - name: Verify checksum
+        run: sha256sum -c SHA256SUMS
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -132,6 +143,6 @@ jobs:
           # previous tag — saves us writing release notes by hand for the
           # common case.
           gh release create "$TAG" \
-            njuska_auto_bot \
+            njuska_auto_bot SHA256SUMS \
             --title "$TAG" \
             --generate-notes

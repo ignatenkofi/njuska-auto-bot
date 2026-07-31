@@ -107,6 +107,22 @@ bot needs only `curl` (for fetching polovni).
 > and the VM just downloads it from the latest tagged release. Saves a few GB
 > of disk and a few minutes per upgrade.
 
+**Downloaded binaries are checksum-verified before they are made
+executable.** The release publishes `SHA256SUMS` alongside the binary;
+`update.sh` and the cloud-init config both check it and refuse to install on
+a mismatch, a missing entry, or a missing sums file.
+
+Be clear about what that buys: it catches truncated downloads, a CDN serving
+the wrong bytes, and `latest` resolving to an asset that does not match its
+own release. It does **not** make the binary tamper-proof — the sums file
+travels with the artifact, so whoever can replace one can replace both. That
+needs a signature checked against a key from somewhere else, which is tracked
+in devsecops-pipeline#18.
+
+Releases tagged before checksums existed have no `SHA256SUMS`. `update.sh`
+fails closed on those; `ALLOW_UNVERIFIED=1` re-runs without the check and
+exists only until the oldest release anyone still installs carries one.
+
 ## Step 3 — Create a dedicated user
 
 We run the bot as its own user (`njuska`) so a bug in the service can't
@@ -119,16 +135,27 @@ sudo useradd --system --create-home --home-dir /opt/njuska-auto-bot --shell /usr
 ## Step 4 — Download the latest binary
 
 ```bash
+cd /opt/njuska-auto-bot
+
 sudo -u njuska curl -L --fail \
     https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot \
-    -o /opt/njuska-auto-bot/njuska_auto_bot
+    -o njuska_auto_bot
 
-sudo -u njuska chmod +x /opt/njuska-auto-bot/njuska_auto_bot
+sudo -u njuska curl -L --fail \
+    https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/SHA256SUMS \
+    -o SHA256SUMS
+
+sha256sum -c SHA256SUMS && sudo -u njuska rm -f SHA256SUMS
+
+sudo -u njuska chmod +x njuska_auto_bot
 
 # Sanity-check
-/opt/njuska-auto-bot/njuska_auto_bot --version 2>/dev/null || \
-    file /opt/njuska-auto-bot/njuska_auto_bot
+./njuska_auto_bot --version 2>/dev/null || file njuska_auto_bot
 ```
+
+Verify first, `chmod +x` second — same order the scripted paths use, and for
+the same reason: an unverified file should not become executable. If
+`sha256sum -c` fails, stop; do not chmod anything.
 
 `releases/latest/download/...` is GitHub's canonical "newest release" URL —
 it redirects to whichever tagged version was most recently published. To

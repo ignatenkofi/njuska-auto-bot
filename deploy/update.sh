@@ -19,6 +19,7 @@ set -euo pipefail
 # most recently. Pin to a specific version (e.g. v0.2.0/download/...) if
 # you want to opt out of auto-upgrades.
 BINARY_URL="https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot"
+SUMS_URL="https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/SHA256SUMS"
 DEST="/opt/njuska-auto-bot/njuska_auto_bot"
 BACKUP="$DEST.bak"
 SERVICE="njuska-auto-bot"
@@ -34,6 +35,47 @@ echo "==> Downloading latest release binary..."
 # currently-running binary. `--fail` makes curl exit non-zero on HTTP 4xx/5xx
 # instead of silently writing the error body.
 sudo -u njuska curl -L --fail "$BINARY_URL" -o "$DEST.new"
+
+# Verify BEFORE chmod +x: an unverified file should never become executable.
+#
+# What this defends against: a truncated or corrupted download, a CDN or
+# mirror serving the wrong bytes, and "latest" resolving to an asset that
+# does not match its own release. What it does NOT defend against: a
+# compromised release pipeline — the sums file travels with the artifact,
+# so an attacker who can replace one can replace both. Real tamper
+# resistance needs a signature verified against a key that does not come
+# from the same place (devsecops-pipeline#18).
+echo "==> Verifying checksum..."
+if sudo -u njuska curl -L --fail "$SUMS_URL" -o "$DEST.sums" 2>/dev/null; then
+    expected="$(awk '$2 == "njuska_auto_bot" || $2 == "*njuska_auto_bot" {print $1}' "$DEST.sums")"
+    actual="$(sha256sum "$DEST.new" 2>/dev/null | awk '{print $1}')"
+    sudo -u njuska rm -f "$DEST.sums"
+    if [ -z "$expected" ]; then
+        echo "SHA256SUMS has no entry for njuska_auto_bot — refusing to install" >&2
+        sudo -u njuska rm -f "$DEST.new"
+        exit 1
+    fi
+    if [ "$expected" != "$actual" ]; then
+        echo "checksum MISMATCH — refusing to install" >&2
+        echo "  expected $expected" >&2
+        echo "  actual   $actual" >&2
+        sudo -u njuska rm -f "$DEST.new"
+        exit 1
+    fi
+    echo "    ok: $actual"
+elif [ "${ALLOW_UNVERIFIED:-0}" = "1" ]; then
+    # Escape hatch for the transition only: releases tagged before SHA256SUMS
+    # was introduced have no sums file. Remove this branch once the oldest
+    # release anyone still installs carries one.
+    echo "    SHA256SUMS not published for this release; ALLOW_UNVERIFIED=1 given, continuing" >&2
+else
+    echo "SHA256SUMS not published for this release — refusing to install." >&2
+    echo "Releases tagged before checksums were introduced have none; either" >&2
+    echo "upgrade to a newer release or re-run with ALLOW_UNVERIFIED=1." >&2
+    sudo -u njuska rm -f "$DEST.new"
+    exit 1
+fi
+
 sudo -u njuska chmod +x "$DEST.new"
 
 # Sanity: does the new binary even execute on this box (glibc, arch)?
