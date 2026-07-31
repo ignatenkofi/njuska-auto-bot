@@ -192,6 +192,11 @@ Raspberry Pi, anything systemd-capable):
 ➡ **Follow [deploy/DEPLOY.md](deploy/DEPLOY.md)** end-to-end.
 
 Highlights:
+- **On Proxmox the VM itself comes from code**: `deploy/provision-vm.sh`
+  builds it from a Debian cloud image and
+  `deploy/cloud-init/njuska-vm.yaml` installs the bot on first boot. Only
+  the secrets are placed by hand. Restore from zero is therefore one
+  command plus one `.env`, not a remembered sequence of clicks.
 - The VM needs only `curl` + `git`. No Rust toolchain — binary comes from
   GitHub Releases.
 - 5-min CF Worker setup ([cf-proxy/README.md](cf-proxy/README.md)) for the

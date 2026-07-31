@@ -8,9 +8,45 @@ few MB of disk for SQLite + HTML dumps. The smallest VM you can spin up
 will be massively over-provisioned. **1 vCPU, 512 MB RAM, 5 GB disk** is
 overkill but cheap.
 
-## Step 1 — Create the VM in Proxmox
+## Step 1 — Create the VM
 
-Defaults aside, pick:
+### From code (preferred)
+
+Run **on the Proxmox node**:
+
+```bash
+git clone --depth 1 https://github.com/ignatenkofi/njuska-auto-bot /tmp/njuska
+sudo VMID=9001 STORAGE=local-zfs BRIDGE=vmbr0 bash /tmp/njuska/deploy/provision-vm.sh
+```
+
+That creates the VM from a Debian 12 cloud image and hands it
+`deploy/cloud-init/njuska-vm.yaml`, which does Steps 2, 3, 4 and 6 of this
+document on first boot: packages, the `njuska` user, the release binary
+(with a `--version` preflight), and the systemd units. Steps 5 and 7 stay
+manual — see below.
+
+Tunables are environment variables; defaults are in the script's header.
+
+**Why this exists.** Until 2026-07 the VM was hand-built and therefore
+un-restorable: when the hypervisor was wiped, the bot went with it and
+nothing in the repo described how to get it back (#70). A VM you cannot
+recreate from the repository is inventory, not deployment.
+
+**The one thing cloud-init will not do is secrets.** On Proxmox the
+user-data lives as a snippet in a datastore and is readable by anyone with
+access to that storage, so the Telegram token and the CF Worker secret must
+not go near it. They arrive on the running VM in Step 5.
+
+The unit is `enable`d but not started on first boot: without `.env` the bot
+exits immediately and systemd would restart-loop it every 10 seconds,
+filling the journal before you have a chance to place the file. Future
+reboots start it normally.
+
+### By hand (fallback)
+
+If you are deploying somewhere other than Proxmox — a VPS, a Raspberry Pi,
+anything systemd-capable — build the box yourself and continue from Step 2:
+
 - **OS**: Debian 12 (bookworm) or Ubuntu 22.04+ — anything with systemd
 - **vCPU**: 1
 - **RAM**: 512 MB (or 256 MB; really doesn't matter)
@@ -18,8 +54,6 @@ Defaults aside, pick:
   fits hundreds of thousands of dedup rows)
 - **Network**: bridged onto your LAN, give it a static IP via DHCP
   reservation so you can SSH reliably
-
-Install the OS as usual.
 
 ## Step 2 — Install prerequisites on the VM
 
