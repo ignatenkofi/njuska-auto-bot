@@ -16,7 +16,7 @@ Run **on the Proxmox node**:
 
 ```bash
 git clone --depth 1 https://github.com/ignatenkofi/njuska-auto-bot /tmp/njuska
-sudo VMID=9001 STORAGE=local-zfs BRIDGE=vmbr0 bash /tmp/njuska/deploy/provision-vm.sh
+sudo bash /tmp/njuska/deploy/provision-vm.sh
 ```
 
 That creates the VM from a Debian 12 cloud image and hands it
@@ -26,6 +26,35 @@ document on first boot: packages, the `njuska` user, the release binary
 manual — see below.
 
 Tunables are environment variables; defaults are in the script's header.
+
+**Where the VM lands, and why.** The defaults put it on VLAN 41 at
+`192.168.41.200/24` — the segment that hosts the test polygon. That looks
+odd for a production service until you compare the alternatives on this
+network: VLAN 10 is `vlan10_MGMT`, home *and* hardware management sharing
+one L2 (all three routers plus the hypervisor's admin interface), and this
+bot parses HTML from a public site, i.e. it digests input an attacker
+controls. VLAN 41 is the only existing segment that is deny-by-default, and
+what it permits outbound — 443, 53, 123 — is exactly this bot's appetite.
+The untrusted-workload segment that *ought* to hold it (VLAN 20) does not
+exist yet.
+
+Two consequences the script handles for you:
+
+- **Static addressing.** VLAN 41 has no DHCP; the address comes from the
+  polygon's plan (`.200`, the start of its reserved range) via
+  `--ipconfig0`, and DNS points at public resolvers because the router's
+  own resolver is unreachable from that segment by design.
+- **Second echelon.** The polygon's VMs get the `polygon` PVE security
+  group on their NIC from OpenTofu. This VM is not OpenTofu-managed, so the
+  script attaches the same group by hand — otherwise it would sit in the
+  polygon's segment without the polygon's protection. If the group is
+  missing the script says so loudly rather than proceeding unprotected.
+
+Also note that `apt` inside that segment must use HTTPS mirrors — port 80
+is not permitted outbound — which the cloud-init config sets up before the
+first `apt` call.
+
+To deploy somewhere else, override: `VLAN_TAG=`, `IP_CIDR=`, `SEC_GROUP=`.
 
 **Why this exists.** Until 2026-07 the VM was hand-built and therefore
 un-restorable: when the hypervisor was wiped, the bot went with it and

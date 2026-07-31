@@ -19,7 +19,12 @@
 #   STORAGE       (local-zfs)         — где живёт диск VM
 #   SNIPPET_STORE (local)             — datastore с content-type snippets
 #   BRIDGE        (vmbr0)
-#   VLAN_TAG      ()                  — пусто = без тега
+#   VLAN_TAG      (41)                — сегмент полигона; пусто = без тега
+#   IP_CIDR       (192.168.41.200/24) — статика; в VLAN 41 DHCP нет
+#   GATEWAY       (192.168.41.1)      — шлюз сегмента на RB5009
+#   NAMESERVER    (1.1.1.1 8.8.8.8)   — публичные: резолвер роутера из 41
+#                                       недоступен by design (input к RB закрыт)
+#   SEC_GROUP     (polygon)           — PVE security group на NIC; пусто = не вешать
 #   MEMORY_MB     (512)
 #   CORES         (1)
 #   DISK_GB       (5)
@@ -36,7 +41,11 @@ VM_NAME="${VM_NAME:-njuska-bot}"
 STORAGE="${STORAGE:-local-zfs}"
 SNIPPET_STORE="${SNIPPET_STORE:-local}"
 BRIDGE="${BRIDGE:-vmbr0}"
-VLAN_TAG="${VLAN_TAG:-}"
+VLAN_TAG="${VLAN_TAG:-41}"
+IP_CIDR="${IP_CIDR:-192.168.41.200/24}"
+GATEWAY="${GATEWAY:-192.168.41.1}"
+NAMESERVER="${NAMESERVER:-1.1.1.1 8.8.8.8}"
+SEC_GROUP="${SEC_GROUP:-polygon}"
 MEMORY_MB="${MEMORY_MB:-512}"
 CORES="${CORES:-1}"
 DISK_GB="${DISK_GB:-5}"
@@ -71,6 +80,7 @@ curl -L --fail "$IMAGE_URL" -o "$image"
 echo "==> создаю VM $VMID ($VM_NAME)"
 net="virtio,bridge=$BRIDGE"
 [ -n "$VLAN_TAG" ] && net="$net,tag=$VLAN_TAG"
+[ -n "$SEC_GROUP" ] && net="$net,firewall=1"
 
 qm create "$VMID" \
     --name "$VM_NAME" \
@@ -94,7 +104,33 @@ qm set "$VMID" --boot order=scsi0
 qm set "$VMID" --ide2 "$STORAGE:cloudinit"
 qm set "$VMID" --serial0 socket --vga serial0
 qm set "$VMID" --ciuser admin --sshkeys "$SSH_KEYFILE"
+# Сеть задаём через ipconfig0, а не в user-data: сетевой конфиг cloud-init
+# приходит отдельным источником (network-config), который Proxmox генерирует
+# сам — netplan-блок внутри user-data был бы просто проигнорирован.
+qm set "$VMID" --ipconfig0 "ip=$IP_CIDR,gw=$GATEWAY"
+qm set "$VMID" --nameserver "$NAMESERVER"
 qm set "$VMID" --cicustom "user=$SNIPPET_STORE:snippets/njuska-vm.yaml"
+
+# Второй эшелон: та же security group, что tofu вешает на раннеры. Без неё
+# VM жила бы в полигонном сегменте без полигонной защиты — контракт RB5009
+# (первый эшелон) её бы прикрыл, но на NIC не осталось бы ничего.
+if [ -n "$SEC_GROUP" ]; then
+    if grep -q "^\[group $SEC_GROUP\]" /etc/pve/firewall/cluster.fw 2>/dev/null; then
+        cat > "/etc/pve/firewall/$VMID.fw" <<FW
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: DROP
+
+[RULES]
+GROUP $SEC_GROUP
+FW
+        echo "provision-vm: security group $SEC_GROUP привязана к $VMID"
+    else
+        echo "provision-vm: ВНИМАНИЕ — группы [$SEC_GROUP] нет в cluster.fw," \
+             "VM останется без второго эшелона; проверить polygon-iac (#25)" >&2
+    fi
+fi
 
 echo "==> старт"
 qm start "$VMID"
@@ -110,7 +146,7 @@ cloud-init на первой загрузке поставит пакеты, з�
 Дальше, по DEPLOY.md шаг 5, остаётся единственное ручное действие —
 секреты:
 
-  ssh admin@<ip>
+  ssh admin@${IP_CIDR%%/*}
   sudo -u njuska vim /opt/njuska-auto-bot/.env
   sudo systemctl start njuska-auto-bot
   sudo journalctl -u njuska-auto-bot -f
