@@ -22,6 +22,18 @@ users:
     homedir: /opt/njuska-auto-bot
     lock_passwd: true
 
+# Зеркала по https. В VLAN 41 контракт RB5009 выпускает наружу только
+# 443/53/123, а Debian cloud-образ по умолчанию ходит в deb.debian.org по
+# HTTP/80 — package_update молча повис бы до таймаута. Полигонная роль base
+# решает это тем же переключением; здесь оно нужно до первого apt.
+apt:
+  primary:
+    - arches: [default]
+      uri: https://deb.debian.org/debian
+  security:
+    - arches: [default]
+      uri: https://security.debian.org/debian-security
+
 package_update: true
 packages:
   - curl
