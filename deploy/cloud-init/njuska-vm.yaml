@@ -61,13 +61,17 @@ runcmd:
   # бинарь приезжает готовым из релиза, Rust на VM не ставится.
   - [ git, clone, --depth, "1", "https://github.com/ignatenkofi/njuska-auto-bot.git", /opt/njuska-auto-bot/src ]
 
-  # Скачиваем и СВЕРЯЕМ до chmod: непроверенный файл не должен становиться
-  # исполняемым. Защищает от обрыва загрузки и от подмены байт на пути
-  # доставки; от компрометации самого релиза — нет, сумма едет оттуда же
-  # (devsecops-pipeline#18). Падение здесь намеренно валит cloud-init:
-  # лучше VM без бота, чем VM с неизвестным бинарём.
-  - [ sh, -c, "cd /opt/njuska-auto-bot && curl -L --fail https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot -o njuska_auto_bot && curl -L --fail https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/SHA256SUMS -o SHA256SUMS && sha256sum -c SHA256SUMS && rm -f SHA256SUMS" ]
-  - [ chmod, "0755", /opt/njuska-auto-bot/njuska_auto_bot ]
+  # Скачиваем, СВЕРЯЕМ и только потом chmod — одной командой. Непроверенный
+  # файл не должен становиться исполняемым, и это не должно зависеть от того,
+  # останавливает ли cloud-init скрипт runcmd после ошибки: он собирает пункты
+  # в обычный шелл-скрипт без `set -e`, поэтому отдельный `chmod` следующим
+  # пунктом отработал бы и после проваленной сверки. Цепочка `&&` убирает
+  # вопрос целиком — не важно, как ведёт себя раннер.
+  # Защищает от обрыва загрузки и от подмены байт на пути доставки; от
+  # компрометации самого релиза — нет, сумма едет оттуда же
+  # (devsecops-pipeline#18). Падение здесь оставляет VM без бота — это и есть
+  # желаемый исход: лучше без бота, чем с неизвестным бинарём.
+  - [ sh, -c, "cd /opt/njuska-auto-bot && curl -L --fail https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot -o njuska_auto_bot && curl -L --fail https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/SHA256SUMS -o SHA256SUMS && sha256sum -c SHA256SUMS && rm -f SHA256SUMS && chmod 0755 njuska_auto_bot" ]
 
   # Preflight: бинарь вообще исполняется на этой машине (glibc, arch)?
   # --version не требует ни конфига, ни сети, ни базы. Падение здесь лучше
