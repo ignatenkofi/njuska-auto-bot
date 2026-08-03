@@ -2,11 +2,23 @@
 
 This file is loaded into Claude's context every session. Keep it tight and current.
 
-## About the user
+## Цель проекта
 
-First practical Rust project after reading the first chapters of the Rust Book. Theory is there (ownership, borrowing, `Result`/`Option`, traits) — idiomatic experience is not. Explain idioms inline as short asides: *why* `&str` vs `String` here, what `?` desugars to, *why* `anyhow` at the binary boundary vs `thiserror` in a module. One or two sentences, not a tutorial.
+**Эксплуатация и безопасность, не обучение.** Проект начинался как первый
+практический Rust после Rust Book, и этот раздел раньше просил объяснять
+идиомы на ходу. Владелец закрыл вопрос 2026-07-31: учебная цель больше не
+действует — см. `adr/0001-hosting-platform-cloudflare-workers.md`, где это
+записано и как основание решения о платформе, и как обязательная правка
+этого файла в разделе «Последствия».
 
-When the user proposes something C++/Python-shaped, push back gently and explain the Rust idiom instead of silently rewriting.
+Практический смысл: при развилке «понятнее для новичка» против «надёжнее
+или безопаснее в проде» выбирается второе, и объяснять идиомы ради
+объяснения не нужно. Пояснение уместно там, где оно обосновывает выбор
+(почему `thiserror` в модуле, а `anyhow` на границе бинаря), а не там, где
+оно учит языку.
+
+Предложение в C++/Python-стиле по-прежнему стоит развернуть в сторону
+Rust-идиомы — но по инженерной причине, а не по педагогической.
 
 ## Pacing
 
@@ -51,6 +63,13 @@ Never hardcode tokens, chat IDs, or any credential. Always read from env (`.env`
 - Run `cargo test` after every change that touches non-trivial logic.
 
 ## Resilience invariants
+
+Сформулированы в терминах долгоживущего процесса — то есть под нынешнюю
+платформу (Proxmox VM, поллинг, SQLite на диске). ADR 0001 принял переезд
+на Cloudflare Workers, где форма у них другая: Cron Trigger вместо цикла
+опроса, webhook вместо long polling, D1 вместо SQLite. **До переезда
+инварианты ниже действуют как есть**; переформулировать их — часть той
+миграции, а не повод ослаблять сейчас.
 
 These were agreed at project start — don't quietly drop them in a refactor:
 

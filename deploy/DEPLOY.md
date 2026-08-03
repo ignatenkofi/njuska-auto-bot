@@ -258,12 +258,32 @@ sudo systemctl disable njuska-auto-bot
 # Upgrade — pull new binary, restart
 sudo /opt/njuska-auto-bot/src/deploy/update.sh
 
-# (Equivalent manually:)
+# (Equivalent manually — note the checksum step: it is not optional, and
+#  this block is read exactly when the scripted path already failed.)
+# R=https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download
+# D=/opt/njuska-auto-bot/njuska_auto_bot
 # sudo systemctl stop njuska-auto-bot
-# sudo -u njuska curl -L --fail \
-#     https://github.com/ignatenkofi/njuska-auto-bot/releases/latest/download/njuska_auto_bot \
-#     -o /opt/njuska-auto-bot/njuska_auto_bot
-# sudo -u njuska chmod +x /opt/njuska-auto-bot/njuska_auto_bot
+# # Download to a sibling so a failed download cannot trash the running binary
+# sudo -u njuska curl -L --fail "$R/njuska_auto_bot" -o "$D.new"
+# sudo -u njuska curl -L --fail "$R/SHA256SUMS"     -o "$D.sums"
+# # Verify BEFORE chmod +x — an unverified file must not become executable
+# if ( cd /opt/njuska-auto-bot \
+#      && awk '$2 ~ /^\*?njuska_auto_bot$/ {print $1"  njuska_auto_bot.new"}' \
+#           njuska_auto_bot.sums | sha256sum -c - ); then
+#     sudo -u njuska rm -f "$D.sums"
+#     sudo -u njuska chmod +x "$D.new"
+#     # Preflight, as update.sh does it: a binary that verifies but cannot run
+#     # must not replace one that works.
+#     "$D.new" --version \
+#       && sudo -u njuska mv "$D.new" "$D" \
+#       || { echo "new binary does not run — keeping the old one" >&2
+#            sudo -u njuska rm -f "$D.new"; }
+# else
+#     # Covers both a mismatch and a missing/404 SHA256SUMS: sha256sum -c on
+#     # empty input also fails, so this path is fail-closed.
+#     echo "checksum mismatch or no entry — refusing to install" >&2
+#     sudo -u njuska rm -f "$D.new" "$D.sums"
+# fi
 # sudo systemctl start njuska-auto-bot
 ```
 
