@@ -15,6 +15,9 @@ on:
   # vulnerable (#28). Monday 06:20 UTC, after Dependabot's 06:00 sweep.
   schedule:
     - cron: "20 6 * * 1"
+  # On-demand run: without it the audit job can only be exercised by waiting
+  # for Monday or pushing a commit (#83).
+  workflow_dispatch:
 
 # Cancel in-flight runs when a new commit lands on the same branch — keeps
 # the queue from filling up with stale jobs while you iterate.
